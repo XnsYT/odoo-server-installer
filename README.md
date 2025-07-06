@@ -8,6 +8,8 @@ Welcome! This project provides an easy, reliable, and production-ready way to in
 
 **Supported Distributions:**
 - Debian 12 (Bookworm) and Ubuntu 24.04 LTS (Noble Numbat) are fully supported.
+- Alpine Linux support for containerized environments (experimental).
+- Basic support for RHEL/CentOS/Fedora and Arch Linux distributions.
 - The script is designed for modern Debian-based distributions. Other Debian-based distros (like Ubuntu 22.04, Linux Mint, etc.) may work, but only Debian 12+ and Ubuntu 24.04+ are officially tested and recommended.
 
 **Recommended System:**
@@ -34,6 +36,7 @@ Welcome! This project provides an easy, reliable, and production-ready way to in
    - [Domain Configuration](#domain-configuration)
    - [Server Installation](#server-installation)
    - [Initial Setup](#initial-setup)
+   - [Advanced Options](#advanced-options)
 
 2. [Access and Usage](#access-and-usage)
    - [First Launch](#first-launch)
@@ -65,6 +68,11 @@ Welcome! This project provides an easy, reliable, and production-ready way to in
    - [Technical Support](#technical-support)
    - [Updates](#updates)
 
+8. [Extensibility and Customization](#extensibility-and-customization)
+   - [Module System](#module-system)
+   - [Custom Configurations](#custom-configurations)
+   - [Performance Tuning](#performance-tuning)
+
 ---
 
 # Installation Guide
@@ -80,8 +88,7 @@ Welcome! This project provides an easy, reliable, and production-ready way to in
 ## Server Installation
 
 1. Preparation:
-you can change the langage but by default its in english 
-look on the repo to see whats available 
+
    ```bash
    git clone https://github.com/XnsYT/odoo-server-installer-en.git
    cd odoo-server-installer-en
@@ -95,6 +102,28 @@ look on the repo to see whats available
    - Security
    - Monitoring
    - Backups
+
+## Advanced Options
+
+The installer now supports additional options:
+
+```bash
+./odoo-server-installer-en.sh --help
+```
+
+Key new features:
+
+- **Dry-run mode**: Simulate installation without changing your system
+  ```bash
+  sudo ./odoo-server-installer-en.sh --dry-run
+  ```
+
+- **Distribution detection**: Automatic adaptation to your Linux distribution
+- **Cache system**: Skip already completed operations during re-runs
+- **Parallel execution**: Speed up installation by running independent tasks in parallel
+- **Enhanced validation**: Better domain, email, and service validation
+
+---
 
 ## Initial Setup
 
@@ -218,4 +247,44 @@ look on the repo to see whats available
 
 ---
 
+# Extensibility and Customization
+
+## Module System
+The installer now supports a modular approach:
+
+- **External modules**: Extend functionality through external script modules
+- **Custom modules**: Create your own modules for specialized deployments
+- **Module examples**: Built-in examples to get started
+
+```bash
+# Location of modules
+./modules/
+```
+
+## Custom Configurations
+
+- **Dynamic tuning**: Automatic optimization based on available resources
+- **Distribution-specific tweaks**: Optimal configurations for different Linux distributions
+- **Virtualization detection**: Parameter adjustments for virtual environments
+
+## Performance Tuning
+
+- **Parallel processing**: Multi-threading support for faster installation
+- **Caching system**: Skip already completed steps when re-running
+- **Resource-based optimization**: PostgreSQL, Redis, and Nginx settings optimized for your hardware
+
+---
+
 Thank you for checking out **odoo-server-installer**! If you have questions, ideas, or want to contribute, feel free to open an issue or pull request. Your feedback is welcome and helps make this project better for everyone.
+
+## Recent Updates
+
+### Version 1.2.0
+- Added modular architecture for better extensibility
+- Implemented dry-run mode for testing without system changes
+- Added support for Alpine Linux and improved compatibility with other distributions
+- Enhanced validation and error handling
+- Added caching system for idempotent operations
+- Implemented parallel execution for faster installation
+- Comprehensive preliminary checks before installation
+- Dynamic resource allocation based on system capabilities

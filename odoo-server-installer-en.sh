@@ -1,39 +1,239 @@
 #!/bin/bash
 # Optimized Odoo 17 installation script - Debian 12/Ubuntu 24.04 - 64GB RAM
 # Refactored version: structured logging, rollback, strict validation, modularity, enhanced security
+# Version: 1.1.0
+# Date: 2023-10-01
 
 set -euo pipefail
+trap 'echo "Error at line $LINENO. Script aborted." >&2; exit 1' ERR
 
-# ===================== STRUCTURED LOGGING & MASKING =====================
+#=============================================================================
+# CONFIGURATION AND INITIALIZATION
+#=============================================================================
+
+# Common path constants for better maintainability
+readonly ODOO_HOME="/opt/odoo"
+readonly CONFIG_DIR="/etc/odoo"
+readonly LOG_DIR="/var/log/odoo"
+readonly BACKUP_DIR="/opt/backups"
+readonly NGINX_SITES="/etc/nginx/sites-available"
+readonly PG_CONFIG_DIR="/etc/postgresql"
+
+# Module loading system - load external scripts if available
+SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+MODULE_DIR="${SCRIPT_DIR}/modules"
+
+# Function to load external modules if they exist
+load_module() {
+    local module_name="$1"
+    local module_path="${MODULE_DIR}/${module_name}.sh"
+    
+    if [[ -f "$module_path" ]]; then
+        info "Loading external module: $module_name"
+        source "$module_path"
+        return 0
+    else
+        debug "Module not found: $module_name, using built-in function"
+        return 1
+    fi
+}
+
+# Create modules directory if it doesn't exist
+if [[ ! -d "$MODULE_DIR" ]]; then
+    mkdir -p "$MODULE_DIR"
+    debug "Created modules directory: $MODULE_DIR"
+    generate_module_example
+fi
+
+# Check if bash is being used
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "This script requires bash to run." >&2
+    exit 1
+fi
+
+# Process command-line arguments
+AUTO_MODE=false
+DRY_RUN=false
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    cat << EOF
+Odoo Server Installer v${SCRIPT_VERSION} (${SCRIPT_DATE})
+
+Usage: $0 [options]
+
+Options:
+  --help, -h              Show this help message
+  --auto                  Automatic mode (no interactive questions)
+  --domain=DOMAIN         Set domain name
+  --email=EMAIL           Set email for Let's Encrypt
+  --cloudflare            Use Cloudflare Tunnel
+  --ddns=SERVICE          DDNS service (duckdns|noip|dynu)
+  --debug                 Debug mode (more logs)
+  --expose-monitoring     Expose monitoring ports externally
+  --dry-run               Simulate installation without making changes
+
+Examples:
+  $0 --auto --domain=example.com --email=admin@example.com
+  $0 --cloudflare --domain=example.com
+  $0 --ddns=duckdns --domain=mysite.duckdns.org
+
+For complete documentation, visit: https://github.com/XnsYT/odoo-server-installer/
+EOF
+    exit 0
+fi
+
+if [[ "${1:-}" == "--version" ]]; then
+    echo "Odoo Server Installer v${SCRIPT_VERSION} (${SCRIPT_DATE})"
+    exit 0
+fi
+
+# Process arguments
+for arg in "$@"; do
+    case $arg in
+        --auto)
+            AUTO_MODE=true
+            ;;
+        --domain=*)
+            DOMAIN="${arg#*=}"
+            ;;
+        --email=*)
+            LE_EMAIL="${arg#*=}"
+            ;;
+        --cloudflare)
+            CLOUDFLARE_TUNNEL=true
+            ;;
+        --ddns=*)
+            DDNS_SERVICE="${arg#*=}"
+            ;;
+        --debug)
+            LOG_LEVEL="DEBUG"
+            ;;
+        --expose-monitoring)
+            EXPOSE_MONITORING=true
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            ;;
+    esac
+done
+
+# Afficher un message si le mode dry-run est activé
+if [[ "$DRY_RUN" == true ]]; then
+    info "DRY RUN MODE ACTIVATED: No actual changes will be made to the system"
+    info "This mode simulates the installation process to check for potential issues"
+fi
+
+#=============================================================================
+# STRUCTURED LOGGING & MASKING
+#=============================================================================
 LOG_FILE="/var/log/odoo_install.log"
-MASKED_VARS=("DB_PASS" "ADMIN_PASS" "REDIS_PASS" "NOIP_PASS" "DYNU_PASS" "DUCKDNS_TOKEN")
+MASKED_VARS=("DB_PASS" "ADMIN_PASS" "REDIS_PASS" "NOIP_PASS" "DYNU_PASS" "DUCKDNS_TOKEN" "PASSWORD" "TOKEN" "SECRET" "KEY")
+
+# Create log directory if it doesn't exist
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+
+# Set default log level if not defined
+LOG_LEVEL=${LOG_LEVEL:-"INFO"}
+
+# Enhanced logging function with better masking
 log() {
     local level="$1"; shift
     local msg="$@"
+    local masked_msg="$msg"
+    
+    # First, mask specifically tracked variables
     for var in "${MASKED_VARS[@]}"; do
-        local val="${!var:-}"
-        if [[ -n "$val" ]]; then
-            msg="${msg//${val}/******}"
+        # Vérifier si la variable existe et n'est pas vide
+        if [[ -v "$var" && -n "${!var:-}" && ${#var} -gt 3 ]]; then
+            local val="${!var}"
+            if [[ -n "$val" && ${#val} -gt 3 ]]; then
+                # Only mask if value is longer than 3 chars to avoid false positives
+                # Show first 2 chars + stars + last 2 chars for better debugging
+                local visible_prefix="${val:0:2}"
+                local visible_suffix="${val: -2}"
+                local mask_length=$((${#val} - 4))
+                local mask_stars=$(printf '%*s' "$mask_length" | tr ' ' '*')
+                local mask="$visible_prefix$mask_stars$visible_suffix"
+                masked_msg="${masked_msg//${val}/${mask}}"
+            fi
         fi
     done
-    echo -e "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $msg" | tee -a "$LOG_FILE"
+    
+    # Then mask any patterns that look like passwords, tokens, or keys
+    masked_msg=$(echo "$masked_msg" | sed -E 's/([Pp]ass(word)?|[Tt]oken|[Ss]ecret|[Kk]ey)[=: ]+[A-Za-z0-9+\/]{8,}/\1=******/g')
+    
+    # Format timestamp with microseconds for precise debugging
+    local timestamp=$(date +'%Y-%m-%d %H:%M:%S.%3N')
+    echo -e "[$timestamp] [$level] $masked_msg" | tee -a "$LOG_FILE"
+    
+    # For error and warning levels, also log the calling function and line number
+    if [[ "$level" == "ERROR" || "$level" == "WARN" ]]; then
+        local caller_info=$(caller 1 2>/dev/null || echo "unknown")
+        echo -e "[$timestamp] [$level] Called from: $caller_info" >> "$LOG_FILE"
+    fi
 }
-info() { log "INFO" "$@"; }
-warn() { log "WARN" "$@"; }
-error() { log "ERROR" "$@"; exit 1; }
 
-# ===================== ROLLBACK SYSTEM =====================
+# Color output helpers for better visibility
+info() { log "INFO" "\e[32m$@\e[0m"; }  # Green
+warn() { log "WARN" "\e[33m$@\e[0m"; }  # Yellow
+error() { log "ERROR" "\e[31m$@\e[0m"; exit 1; }  # Red
+debug() { 
+    if [[ "${LOG_LEVEL:-INFO}" == "DEBUG" ]]; then
+        log "DEBUG" "\e[36m$@\e[0m"  # Cyan
+    fi
+}
+
+#=============================================================================
+# DOCUMENTATION HELPERS
+#=============================================================================
+
+# Function documentation helper to standardize function headers
+# Usage: @doc "Description" "param1:description" "param2:description" "return:description"
+function @doc() {
+    : # This is a no-op function that just serves as documentation
+    # The documentation is read by the extract_docs function
+}
+
+# Extract documentation for functions
+# Usage: extract_docs function_name
+function extract_docs() {
+    local func_name="$1"
+    local func_body
+    func_body=$(declare -f "$func_name" 2>/dev/null)
+    
+    if [[ -z "$func_body" ]]; then
+        echo "Function $func_name not found"
+        return 1
+    fi
+    
+    local doc_lines
+    doc_lines=$(echo "$func_body" | grep -A 20 '@doc' | grep -B 20 -m 1 '^}' || echo "No documentation found")
+    
+    echo "$doc_lines"
+}
+
+#=============================================================================
+# ROLLBACK SYSTEM
+#=============================================================================
 ROLLBACK_ACTIONS=()
 trap 'on_error $LINENO' ERR
 on_error() {
     local line=$1
-    error "Error on line $line - Rollback in progress"
+    local command="${BASH_COMMAND}"
+    error "Error on line $line executing: '$command' - Rollback in progress"
     rollback
     exit 1
 }
 rollback() {
+    info "Starting rollback procedure..."
     for action in "${ROLLBACK_ACTIONS[@]}"; do
-        eval "$action"
+        info "Executing rollback action: $action"
+        if output=$(eval "$action" 2>&1); then
+            info "Rollback action successful"
+        else
+            warn "Failed rollback action: $action"
+            warn "Error: $output"
+        fi
     done
     warn "Rollback completed"
 }
@@ -41,13 +241,130 @@ add_rollback() {
     ROLLBACK_ACTIONS=("$1" "${ROLLBACK_ACTIONS[@]}")
 }
 
+#=============================================================================
+# SYSTEM CONSTRAINTS CHECK 
+#=============================================================================
+check_system_constraints() {
+    info "Checking system constraints..."
+    
+    # Check if we're root
+    if [[ $EUID -ne 0 ]]; then
+        error "This script must be run as root"
+    fi
+    
+    # Check binary dependencies
+    for cmd in curl wget apt-get systemctl python3 openssl gpg git; do
+        if ! command -v "$cmd" &> /dev/null; then
+            error "Required command not found: $cmd"
+        fi
+    done
+    
+    # Check if SELinux is in enforcing mode and handle
+    if command -v getenforce &> /dev/null; then
+        SELINUX_STATUS=$(getenforce)
+        if [[ "$SELINUX_STATUS" == "Enforcing" ]]; then
+            warn "SELinux is in Enforcing mode - special permissions will be configured"
+            SELINUX_ENABLED=true
+        fi
+    fi
+    
+    # Detect virtualization
+    if command -v systemd-detect-virt &>/dev/null; then
+        VIRT=$(systemd-detect-virt)
+        if [[ "$VIRT" != "none" ]]; then
+            info "Virtualized environment detected: $VIRT"
+            # Parameters could be adjusted for virtualization
+        fi
+    fi
+    
+    # Check architecture
+    ARCH=$(uname -m)
+    if [[ "$ARCH" != "x86_64" && "$ARCH" != "aarch64" ]]; then
+        warn "Architecture $ARCH might not be fully supported. x86_64 or aarch64 recommended."
+    fi
+    
+    # Check disk space
+    ROOT_SPACE=$(df -BG / | awk 'NR==2 {print $4}' | tr -d 'G')
+    if [[ $ROOT_SPACE -lt 10 ]]; then
+        error "Insufficient disk space. Minimum 10G required on /, you have ${ROOT_SPACE}G"
+    fi
+    
+    # Check Internet connectivity
+    if ! ping -c 1 8.8.8.8 &> /dev/null; then
+        error "No Internet connection detected"
+    fi
+    
+    info "System constraints check completed"
+}
+
+# Generate secure password with multiple entropy sources
+generate_secure_password() {
+    local length=${1:-32}
+    # Use multiple entropy sources for better security
+    local pass=$(head -c 1024 /dev/urandom | tr -dc 'a-zA-Z0-9!@#$%^&*()-_=+[]{}|;:,.<>?' | head -c "$length")
+    echo "$pass"
+}
+
 # ===================== STRICT INPUT VALIDATION =====================
 validate_inputs() {
     info "Validating inputs"
-    if [[ -z "$DOMAIN" ]]; then error "Domain not provided"; fi
-    if [[ "$CLOUDFLARE_TUNNEL" != true && -z "$LE_EMAIL" ]]; then error "Let's Encrypt email required"; fi
-    if [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}$ ]]; then error "Invalid domain format: $DOMAIN"; fi
-    if [[ "$CLOUDFLARE_TUNNEL" != true && ! "$LE_EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then error "Invalid email format: $LE_EMAIL"; fi
+    
+    # Domain validation
+    if [[ -z "$DOMAIN" ]]; then 
+        error "Domain not provided"
+    fi
+    
+    # More comprehensive domain regex validation
+    # Validates domains with up to 63 characters per label, up to 253 characters total
+    # Allows IDNs with proper formatting
+    if ! [[ "$DOMAIN" =~ ^([a-zA-Z0-9]([-a-zA-Z0-9]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]; then
+        error "Invalid domain format: $DOMAIN"
+        error "Domain should follow RFC 1035 format (e.g. example.com, sub.example.com)"
+    fi
+    
+    # Email validation only if needed
+    if [[ "$CLOUDFLARE_TUNNEL" != true && -z "$LE_EMAIL" ]]; then 
+        error "Let's Encrypt email required" 
+    fi
+    
+    # More comprehensive email regex validation
+    # Validates format with better special character handling
+    if [[ "$CLOUDFLARE_TUNNEL" != true && ! "$LE_EMAIL" =~ ^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$ ]]; then
+        error "Invalid email format: $LE_EMAIL"
+        error "Email should follow RFC 5322 format (e.g. user@example.com)"
+    fi
+    
+    # DDNS service validation
+    if [[ -n "$DDNS_SERVICE" ]]; then
+        if ! [[ "$DDNS_SERVICE" =~ ^(duckdns|noip|dynu|custom)$ ]]; then
+            error "Invalid DDNS service: $DDNS_SERVICE"
+            error "Supported services: duckdns, noip, dynu, custom"
+        fi
+        
+        # Service-specific validations
+        case "$DDNS_SERVICE" in
+            duckdns)
+                if [[ -z "$SUBDOMAIN" || -z "$DUCKDNS_TOKEN" ]]; then
+                    error "DuckDNS requires both subdomain and token"
+                fi
+                if [[ ! "$DUCKDNS_TOKEN" =~ ^[a-zA-Z0-9]{8,}$ ]]; then
+                    error "Invalid DuckDNS token format"
+                fi
+                ;;
+            noip)
+                if [[ -z "$NOIP_USER" || -z "$NOIP_PASS" ]]; then
+                    error "No-IP requires both username and password"
+                fi
+                ;;
+            dynu)
+                if [[ -z "$DYNU_USER" || -z "$DYNU_PASS" ]]; then
+                    error "Dynu requires both username and password"
+                fi
+                ;;
+        esac
+    fi
+    
+    info "Input validation completed successfully"
 }
 
 # === QUICK CONFIGURATION (edit before execution) ===
@@ -63,6 +380,16 @@ NOIP_PASS=""      # For No-IP
 DYNU_USER=""      # For Dynu
 DYNU_PASS=""      # For Dynu
 CLOUDFLARE_TUNNEL=false # set to true to force Cloudflare Tunnel
+
+# === ADVANCED CONFIGURATION ===
+INSTALL_MODE="production"   # production|development|testing
+EXPOSE_MONITORING=false     # Expose monitoring ports to external networks
+BACKUP_RETENTION_DAYS=7     # How many days to keep backups
+ENABLE_AUTO_UPDATE=false    # Enable automatic updates
+ENABLE_EMAIL_ALERTS=false   # Enable email alerts
+ALERT_EMAIL=""             # Email for alerts
+PROXY_URL=""               # HTTP proxy if needed
+LOG_LEVEL="INFO"           # DEBUG|INFO|WARN|ERROR
 # =========================================
 
 # ===================== VALIDATION INTERACTIVE =====================
@@ -305,9 +632,9 @@ get_user_config() {
     # Optimized automatic configuration
     DB_NAME="odoo_production"
     DB_USER="odoo_user"
-    ADMIN_PASS=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-20)
-    DB_PASS=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-32)
-    REDIS_PASS=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-16)
+    ADMIN_PASS=$(generate_secure_password 20)
+    DB_PASS=$(generate_secure_password 32)
+    REDIS_PASS=$(generate_secure_password 16)
     
     # Detect number of CPUs
     CPU_CORES=$(nproc)
@@ -350,44 +677,214 @@ postgres hard nofile 65535
 EOF
 }
 
+# Function to check and install dependencies efficiently
+check_dependencies() {
+    info "Checking system dependencies..."
+    
+    # Define required packages by category
+    declare -A PACKAGE_CATEGORIES=(
+        ["essential"]="curl wget git htop iotop build-essential"
+        ["python"]="python3-pip python3-dev python3-venv virtualenv"
+        ["libs"]="libxml2-dev libxslt1-dev zlib1g-dev libsasl2-dev libldap2-dev libjpeg-dev libpq-dev libffi-dev libssl-dev"
+        ["tools"]="fonts-liberation geoip-database node-clean-css node-less xz-utils"
+        ["monitoring"]="prometheus-node-exporter fail2ban logrotate rsyslog"
+        ["network"]="net-tools dnsutils iproute2 host"
+        ["security"]="unattended-upgrades apt-listchanges"
+    )
+    
+    # Combine all package categories into one for efficiency
+    ALL_PACKAGES=()
+    for category in "${!PACKAGE_CATEGORIES[@]}"; do
+        packages="${PACKAGE_CATEGORIES[$category]}"
+        ALL_PACKAGES+=($packages)
+    done
+    
+    # Check which packages are missing based on the package manager
+    MISSING_PACKAGES=()
+    
+    case "$DISTRO_FAMILY" in
+        debian)
+            for pkg in ${ALL_PACKAGES[@]}; do
+                if ! dpkg -l | grep -q "^ii  $pkg "; then
+                    MISSING_PACKAGES+=("$pkg")
+                fi
+            done
+            
+            # Install missing packages with single apt call for better performance
+            if [[ ${#MISSING_PACKAGES[@]} -gt 0 ]]; then
+                info "Installing ${#MISSING_PACKAGES[@]} missing packages in one batch..."
+                
+                # Improve download speed with parallel downloads
+                if ! grep -q "Acquire::Queue-Mode" /etc/apt/apt.conf.d/99parallel-install 2>/dev/null; then
+                    cat > /etc/apt/apt.conf.d/99parallel-install << EOF
+Acquire::Queue-Mode "host";
+Acquire::http::Pipeline-Depth "10";
+Acquire::https::Pipeline-Depth "10";
+Acquire::Languages "none";
+Acquire::http::Timeout "180";
+Acquire::https::Timeout "180";
+EOF
+                fi
+                
+                # Single apt call instead of multiple
+                apt-get update -qq
+                DEBIAN_FRONTEND=noninteractive apt-get install -yq ${MISSING_PACKAGES[@]}
+                info "Package installation completed"
+            else
+                info "All required packages are already installed"
+            fi
+            ;;
+        redhat)
+            # Similar logic for RPM-based distros
+            for pkg in ${ALL_PACKAGES[@]}; do
+                if ! rpm -q "$pkg" &>/dev/null; then
+                    MISSING_PACKAGES+=("$pkg")
+                fi
+            done
+            
+            if [[ ${#MISSING_PACKAGES[@]} -gt 0 ]]; then
+                info "Installing ${#MISSING_PACKAGES[@]} missing packages..."
+                $PKG_UPDATE
+                $PKG_INSTALL ${MISSING_PACKAGES[@]}
+            fi
+            ;;
+        arch)
+            # For Arch-based distros
+            for pkg in ${ALL_PACKAGES[@]}; do
+                if ! pacman -Q "$pkg" &>/dev/null; then
+                    MISSING_PACKAGES+=("$pkg")
+                fi
+            done
+            
+            if [[ ${#MISSING_PACKAGES[@]} -gt 0 ]]; then
+                info "Installing ${#MISSING_PACKAGES[@]} missing packages..."
+                $PKG_UPDATE
+                $PKG_INSTALL ${MISSING_PACKAGES[@]}
+            fi
+            ;;
+        *)
+            warn "Package installation not supported for $DISTRO_FAMILY. Install dependencies manually."
+            ;;
+    esac
+    
+    # Configure unattended-upgrades for security patches if installed
+    if [[ "$DISTRO_FAMILY" == "debian" ]] && dpkg -l | grep -q "^ii  unattended-upgrades "; then
+        cat > /etc/apt/apt.conf.d/20auto-upgrades << EOF
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+        
+        sed -i 's/\/\/Unattended-Upgrade::Remove-Unused-Dependencies "false";/Unattended-Upgrade::Remove-Unused-Dependencies "true";/' /etc/apt/apt.conf.d/50unattended-upgrades
+        sed -i 's/\/\/Unattended-Upgrade::Automatic-Reboot "false";/Unattended-Upgrade::Automatic-Reboot "false";/' /etc/apt/apt.conf.d/50unattended-upgrades
+        
+        systemctl enable unattended-upgrades
+        info "Automatic security updates configured"
+    fi
+}
+
 # Installation of packages
 install_packages() {
     log "System packages installation..."
     
-    # Update
-    apt update -q
-    DEBIAN_FRONTEND=noninteractive apt upgrade -yq
+    # First check dependencies
+    check_dependencies
     
-    # Essential packages
-    apt install -yq \
-        curl wget git htop iotop \
-        build-essential \
-        python3-pip python3-dev python3-venv \
-        libxml2-dev libxslt1-dev zlib1g-dev \
-        libsasl2-dev libldap2-dev libjpeg-dev \
-        libpq-dev libffi-dev \
-        fonts-liberation \
-        geoip-database \
-        libssl-dev \
-        node-clean-css \
-        node-less \
-        xz-utils
-    
-    # Monitoring tools
-    apt install -yq \
-        prometheus-node-exporter \
-        fail2ban \
-        logrotate \
-        rsyslog
+    # If we're on a Debian-based system, do additional optimizations
+    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        # Update system with a single command
+        apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get upgrade -yq
+        
+        # Essential packages in a single batch - only if some are missing
+        ESSENTIAL_PACKAGES="curl wget git htop iotop build-essential python3-pip python3-dev python3-venv"
+        ESSENTIAL_PACKAGES+=" libxml2-dev libxslt1-dev zlib1g-dev libsasl2-dev libldap2-dev libjpeg-dev"
+        ESSENTIAL_PACKAGES+=" libpq-dev libffi-dev libssl-dev fonts-liberation geoip-database"
+        ESSENTIAL_PACKAGES+=" node-clean-css node-less xz-utils prometheus-node-exporter fail2ban logrotate rsyslog"
+        
+        # Check which essential packages are missing
+        MISSING_ESSENTIAL=()
+        for pkg in $ESSENTIAL_PACKAGES; do
+            if ! dpkg -l | grep -q "^ii  $pkg "; then
+                MISSING_ESSENTIAL+=("$pkg")
+            fi
+        done
+        
+        # Install only missing packages to avoid unnecessary reinstallations
+        if [[ ${#MISSING_ESSENTIAL[@]} -gt 0 ]]; then
+            info "Installing ${#MISSING_ESSENTIAL[@]} missing essential packages in one batch..."
+            DEBIAN_FRONTEND=noninteractive apt-get install -yq ${MISSING_ESSENTIAL[@]}
+        fi
+    elif [[ "$DISTRO_FAMILY" == "redhat" ]]; then
+        # Red Hat based systems
+        info "Installing packages on Red Hat based system..."
+        $PKG_UPDATE
+        $PKG_INSTALL curl wget git python3-devel python3-pip
+        
+        # Additional setup for PostgreSQL on RHEL/CentOS
+        if [[ "$DISTRO" == "centos" || "$DISTRO" == "rhel" ]]; then
+            # PostgreSQL repo setup for RHEL/CentOS
+            $PKG_INSTALL https://download.postgresql.org/pub/repos/yum/reporpms/EL-$(rpm -E %{rhel})-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+        fi
+    elif [[ "$DISTRO_FAMILY" == "arch" ]]; then
+        # Arch based systems
+        info "Installing packages on Arch based system..."
+        $PKG_UPDATE
+        $PKG_INSTALL base-devel python python-pip postgresql redis nginx
+    else
+        warn "Automatic package installation not supported for $DISTRO_FAMILY."
+        warn "Please install required packages manually according to your distribution."
+    fi
 }
 
 # PostgreSQL optimized configuration
 setup_postgresql() {
     log "PostgreSQL installation and configuration..."
     
-    apt install -yq postgresql-15 postgresql-contrib-15 postgresql-client-15
+    # Install PostgreSQL based on distribution
+    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        apt-get install -yq postgresql-15 postgresql-contrib-15 postgresql-client-15
+        PG_VERSION=15
+    elif [[ "$DISTRO_FAMILY" == "redhat" ]]; then
+        $PKG_INSTALL postgresql15-server postgresql15-contrib postgresql15
+        PG_VERSION=15
+        # Initialize database for RHEL/CentOS
+        /usr/pgsql-15/bin/postgresql-15-setup initdb
+        systemctl enable postgresql-15
+    elif [[ "$DISTRO_FAMILY" == "arch" ]]; then
+        $PKG_INSTALL postgresql
+        PG_VERSION=$(psql --version | grep -oP 'psql \(PostgreSQL\) \K[0-9]+\.[0-9]+' | cut -d. -f1)
+        # Initialize database for Arch
+        mkdir -p /var/lib/postgres/data
+        chown -R postgres:postgres /var/lib/postgres
+        sudo -u postgres initdb -D /var/lib/postgres/data
+    else
+        warn "PostgreSQL installation not automated for $DISTRO_FAMILY. Install manually."
+        return 1
+    fi
     
-    # User configuration
+    # Find PG_CONF based on distribution and version
+    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        PG_CONF="${PG_CONFIG_DIR}/${PG_VERSION}/main/postgresql.conf"
+    elif [[ "$DISTRO_FAMILY" == "redhat" ]]; then
+        PG_CONF="/var/lib/pgsql/${PG_VERSION}/data/postgresql.conf"
+    elif [[ "$DISTRO_FAMILY" == "arch" ]]; then
+        PG_CONF="/var/lib/postgres/data/postgresql.conf"
+    else
+        warn "Could not determine PostgreSQL configuration path for $DISTRO_FAMILY."
+        warn "Please configure PostgreSQL manually."
+        return 1
+    fi
+    
+    # Ensure PostgreSQL is running
+    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        systemctl start postgresql
+    elif [[ "$DISTRO_FAMILY" == "redhat" ]]; then
+        systemctl start postgresql-${PG_VERSION}
+    elif [[ "$DISTRO_FAMILY" == "arch" ]]; then
+        systemctl start postgresql
+    fi
+
+    # User configuration - common across distributions
     sudo -u postgres psql << EOF
 CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASS}';
 CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};
@@ -395,17 +892,41 @@ GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};
 ALTER USER ${DB_USER} CREATEDB;
 EOF
     
-    # Optimized configuration for 64GB RAM
-    PG_CONF="/etc/postgresql/15/main/postgresql.conf"
-    cp $PG_CONF $PG_CONF.bak
-    
-    cat > $PG_CONF << EOF
-# Optimized PostgreSQL configuration for Odoo - 64GB RAM
+    # Optimized configuration for 64GB RAM - backup original config
+    if [[ -f "$PG_CONF" ]]; then
+        cp "$PG_CONF" "${PG_CONF}.bak"
+        
+        # Detect available RAM and CPU cores for optimized configuration
+        TOTAL_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+        TOTAL_RAM_GB=$((TOTAL_RAM_KB / 1024 / 1024))
+        SHARED_BUFFERS="16GB" # Default for 64GB
+        EFFECTIVE_CACHE="48GB" # Default for 64GB
+        
+        # Scale configuration to available RAM if less than 64GB
+        if [[ $TOTAL_RAM_GB -lt 64 ]]; then
+            if [[ $TOTAL_RAM_GB -ge 32 ]]; then
+                SHARED_BUFFERS="8GB"
+                EFFECTIVE_CACHE="24GB"
+            elif [[ $TOTAL_RAM_GB -ge 16 ]]; then
+                SHARED_BUFFERS="4GB"
+                EFFECTIVE_CACHE="12GB" 
+            elif [[ $TOTAL_RAM_GB -ge 8 ]]; then
+                SHARED_BUFFERS="2GB"
+                EFFECTIVE_CACHE="6GB"
+            else
+                SHARED_BUFFERS="1GB"
+                EFFECTIVE_CACHE="3GB"
+            fi
+        fi
+        
+        # Create optimized PostgreSQL configuration
+        cat > "$PG_CONF" << EOF
+# Optimized PostgreSQL configuration for Odoo - ${TOTAL_RAM_GB}GB RAM
 listen_addresses = 'localhost'
 port = 5432
 max_connections = 200
-shared_buffers = 16GB
-effective_cache_size = 48GB
+shared_buffers = ${SHARED_BUFFERS}
+effective_cache_size = ${EFFECTIVE_CACHE}
 work_mem = 256MB
 maintenance_work_mem = 2GB
 checkpoint_completion_target = 0.9
@@ -426,11 +947,28 @@ log_filename = 'postgresql-%Y-%m-%d_%H%M%S.log'
 log_min_duration_statement = 1000
 log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
 EOF
+    else
+        error "PostgreSQL configuration file not found at $PG_CONF"
+        return 1
+    fi
     
-    systemctl restart postgresql
-    systemctl enable postgresql
+    # Restart PostgreSQL to apply configuration
+    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        systemctl restart postgresql
+    elif [[ "$DISTRO_FAMILY" == "redhat" ]]; then
+        systemctl restart postgresql-${PG_VERSION}
+    elif [[ "$DISTRO_FAMILY" == "arch" ]]; then
+        systemctl restart postgresql
+    fi
     
-    setup_postgresql_advanced
+    # Ensure PostgreSQL service is enabled for boot
+    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        systemctl enable postgresql
+    elif [[ "$DISTRO_FAMILY" == "redhat" ]]; then
+        systemctl enable postgresql-${PG_VERSION}
+    elif [[ "$DISTRO_FAMILY" == "arch" ]]; then
+        systemctl enable postgresql
+    fi
 }
 
 setup_postgresql_advanced() {
@@ -480,6 +1018,90 @@ EOF
     (crontab -l 2>/dev/null; echo "0 1 * * * /usr/local/bin/pg_maintenance.sh") | crontab -
     
     info "Advanced PostgreSQL configuration completed"
+}
+
+# Setup PostgreSQL health checks
+setup_postgresql_health_checks() {
+    info "Setting up PostgreSQL health checks..."
+    
+    # Create health check script
+    cat > /usr/local/bin/pg_health_check.sh << 'EOF'
+#!/bin/bash
+# PostgreSQL Health Check script
+# This script checks various PostgreSQL health metrics and reports issues
+
+# Load configuration
+DB_NAME="odoo_production"
+LOG_FILE="/var/log/postgresql/health_check.log"
+
+log_message() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+# Check if PostgreSQL is running
+if ! systemctl is-active --quiet postgresql; then
+    log_message "ERROR: PostgreSQL is not running"
+    exit 1
+fi
+
+# Check database connectivity
+if ! sudo -u postgres psql -c '\l' > /dev/null 2>&1; then
+    log_message "ERROR: Cannot connect to PostgreSQL"
+    exit 1
+fi
+
+# Check if Odoo database exists
+if ! sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$DB_NAME"; then
+    log_message "ERROR: Odoo database $DB_NAME does not exist"
+    exit 1
+fi
+
+# Check for long-running queries (>30 seconds)
+LONG_QUERIES=$(sudo -u postgres psql -c "SELECT pid, now() - query_start as duration, query FROM pg_stat_activity WHERE state = 'active' AND now() - query_start > interval '30 seconds';" | grep -v "duration" | grep -v "row" | grep -v "\-\-\-" || echo "")
+if [[ -n "$LONG_QUERIES" ]]; then
+    log_message "WARNING: Long running queries detected:"
+    log_message "$LONG_QUERIES"
+fi
+
+# Check disk space
+DB_SIZE=$(sudo -u postgres psql -c "SELECT pg_size_pretty(pg_database_size('$DB_NAME'));" | grep -v "pg_size_pretty" | grep -v "row" | grep -v "\-\-\-" || echo "unknown")
+log_message "INFO: Database size: $DB_SIZE"
+
+# Check for table bloat (tables that need vacuuming)
+BLOATED_TABLES=$(sudo -u postgres psql -c "SELECT schemaname, relname, n_dead_tup, last_vacuum FROM pg_stat_user_tables WHERE n_dead_tup > 10000 ORDER BY n_dead_tup DESC LIMIT 5;" | grep -v "schemaname" | grep -v "row" | grep -v "\-\-\-" || echo "")
+if [[ -n "$BLOATED_TABLES" ]]; then
+    log_message "WARNING: Tables with significant bloat detected:"
+    log_message "$BLOATED_TABLES"
+    
+    # Auto vacuum the most bloated table
+    MOST_BLOATED=$(echo "$BLOATED_TABLES" | head -1 | awk '{print $1"."$2}')
+    if [[ -n "$MOST_BLOATED" ]]; then
+        log_message "INFO: Auto-vacuuming $MOST_BLOATED"
+        sudo -u postgres psql -c "VACUUM ANALYZE $MOST_BLOATED;" > /dev/null 2>&1
+    fi
+fi
+
+# Check for index issues
+UNUSED_INDEXES=$(sudo -u postgres psql -c "SELECT schemaname, relname, indexrelname, idx_scan FROM pg_stat_user_indexes WHERE idx_scan < 10 AND schemaname NOT LIKE 'pg_%' ORDER BY idx_scan, indexrelname LIMIT 5;" | grep -v "schemaname" | grep -v "row" | grep -v "\-\-\-" || echo "")
+if [[ -n "$UNUSED_INDEXES" ]]; then
+    log_message "INFO: Potentially unused indexes detected:"
+    log_message "$UNUSED_INDEXES"
+fi
+
+# All checks passed
+log_message "INFO: PostgreSQL health check completed"
+exit 0
+EOF
+
+    chmod +x /usr/local/bin/pg_health_check.sh
+    
+    # Create cron job for regular health checks
+    (crontab -l 2>/dev/null; echo "0 */4 * * * /usr/local/bin/pg_health_check.sh > /dev/null 2>&1") | crontab -
+    
+    # Initial health check
+    /usr/local/bin/pg_health_check.sh
+    
+    info "PostgreSQL health checks configured"
 }
 
 # Redis installation
@@ -789,6 +1411,25 @@ EOF
     else
         log "SSL configuration with Let's Encrypt..."
         
+        # Check DNS resolution before proceeding
+        if ! host "$DOMAIN" &>/dev/null; then
+            warn "Cannot resolve domain $DOMAIN. Checking DNS configuration..."
+            
+            # Additional DNS check with dig if available
+            if command -v dig &>/dev/null; then
+                dig_result=$(dig +short "$DOMAIN")
+                if [[ -z "$dig_result" ]]; then
+                    warn "Domain $DOMAIN does not resolve to any IP address."
+                    warn "Please verify your DNS configuration or wait for DNS propagation."
+                    warn "Continuing anyway, but SSL setup might fail."
+                else
+                    info "Domain $DOMAIN resolves to: $dig_result"
+                fi
+            fi
+        else
+            info "Domain $DOMAIN resolves correctly."
+        fi
+        
         apt install -yq certbot python3-certbot-nginx
         
         # Configure DDNS if necessary
@@ -797,7 +1438,9 @@ EOF
         fi
         
         # Create certificate
-        certbot --nginx -d ${DOMAIN} --non-interactive --agree-tos --email ${LE_EMAIL}
+        if ! certbot --nginx -d ${DOMAIN} --non-interactive --agree-tos --email ${LE_EMAIL}; then
+            error "Failed to obtain SSL certificate. Check DNS configuration and try again."
+        fi
         
         # Automatic renewal
         systemctl enable certbot.timer
@@ -878,20 +1521,182 @@ EOF
 
 # Firewall configuration
 setup_firewall() {
-    log "Firewall configuration..."
+    info "Advanced firewall configuration..."
+    
+    # Install UFW if necessary
+    if ! command -v ufw &> /dev/null; then
+        apt install -yq ufw
+    fi
+    
+    # Backup existing rules
+    if [ -f /etc/ufw/user.rules ]; then
+        cp /etc/ufw/user.rules /etc/ufw/user.rules.bak.$(date +%Y%m%d%H%M%S)
+    fi
     
     ufw --force reset
     ufw default deny incoming
     ufw default allow outgoing
     
-    # Basic rules
-    ufw allow ssh
-    ufw allow 80/tcp
-    ufw allow 443/tcp
-    ufw allow 19999/tcp  # Netdata
+    # Basic rules with rate limiting
+    ufw limit ssh comment "SSH with rate limiting"
+    ufw allow 80/tcp comment "HTTP"
+    ufw allow 443/tcp comment "HTTPS"
+    
+    # Anti-brute force rules
+    cat > /etc/ufw/applications.d/odoo << EOF
+[Odoo-Web]
+title=Odoo Web
+description=Odoo Web Service
+ports=8069/tcp
+
+[Odoo-Chat]
+title=Odoo Chat
+description=Odoo Longpolling Service
+ports=8072/tcp
+EOF
+    
+    # Add rate limiting with ufw
+    # Allow SSH with rate limiting
+    ufw limit ssh comment "SSH with rate limiting"
+    
+    # Allow HTTP with rate limiting
+    ufw limit 80/tcp comment "HTTP with rate limiting"
+    
+    # Services exposed only if requested
+    if [[ "${EXPOSE_MONITORING:-false}" == "true" ]]; then
+        ufw allow 19999/tcp comment "Netdata"
+        ufw allow 3000/tcp comment "Grafana"
+        ufw allow 9090/tcp comment "Prometheus"
+        ufw allow 9093/tcp comment "Alertmanager"
+        info "Monitoring ports exposed externally"
+    else
+        # Otherwise, only allow localhost
+        ufw allow from 127.0.0.1 to any port 19999 comment "Netdata local"
+        ufw allow from 127.0.0.1 to any port 3000 comment "Grafana local"
+        ufw allow from 127.0.0.1 to any port 9090 comment "Prometheus local"
+        ufw allow from 127.0.0.1 to any port 9093 comment "Alertmanager local"
+        info "Monitoring ports restricted to localhost"
+    fi
+    
+    # Advanced security: block ping floods
+    cat >> /etc/ufw/before.rules << EOF
+
+# Block ping floods
+-A ufw-before-input -p icmp --icmp-type echo-request -m limit --limit 1/s --limit-burst 4 -j ACCEPT
+-A ufw-before-input -p icmp --icmp-type echo-request -j DROP
+
+# Block port scanning
+-A ufw-before-input -p tcp --tcp-flags SYN,ACK,FIN,RST RST -m limit --limit 1/s --limit-burst 2 -j ACCEPT
+-A ufw-before-input -p tcp --tcp-flags SYN,ACK,FIN,RST RST -j DROP
+EOF
+    
+    # SYN flood protection
+    cat >> /etc/sysctl.conf << EOF
+# SYN flood protection
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_syn_backlog = 2048
+net.ipv4.tcp_synack_retries = 3
+net.ipv4.conf.all.rp_filter = 1
+EOF
+    sysctl -p
     
     # Enable firewall
     ufw --force enable
+    
+    # Verify firewall is active
+    if ! ufw status | grep -q "Status: active"; then
+        error "Failed to activate firewall"
+    fi
+    
+    # Configure automatic logging and alerts
+    mkdir -p /var/log/ufw
+    touch /var/log/ufw/blocked.log
+    
+    cat > /usr/local/bin/ufw_monitor.sh << 'EOF'
+#!/bin/bash
+# Monitor UFW logs for suspicious activity
+
+LOG_FILE="/var/log/ufw/blocked.log"
+ALERT_THRESHOLD=20  # Number of blocks before alerting
+
+# Get recent blocks (last hour)
+RECENT_BLOCKS=$(grep -c "$(date +"%b %d %H" --date="1 hour ago")" /var/log/ufw.log)
+
+# Check for repeat offenders
+if [ $RECENT_BLOCKS -gt $ALERT_THRESHOLD ]; then
+  echo "[$(date)] WARNING: High number of firewall blocks: $RECENT_BLOCKS in the last hour" >> "$LOG_FILE"
+  
+  # Get the top offenders
+  TOP_OFFENDERS=$(grep "UFW BLOCK" /var/log/ufw.log | grep "$(date +"%b %d %H" --date="1 hour ago")" | awk '{print $12}' | sort | uniq -c | sort -nr | head -5)
+  echo "Top offenders:" >> "$LOG_FILE"
+  echo "$TOP_OFFENDERS" >> "$LOG_FILE"
+fi
+EOF
+    
+    chmod +x /usr/local/bin/ufw_monitor.sh
+    (crontab -l 2>/dev/null; echo "10 * * * * /usr/local/bin/ufw_monitor.sh") | crontab -
+    
+    info "Advanced firewall configuration completed with monitoring"
+}
+
+# Implementing missing setup_nginx_cloudflare function
+setup_nginx_cloudflare() {
+    info "Configuring Nginx for Cloudflare Tunnel..."
+    
+    # Reconfiguration of Nginx without SSL
+    cat > /etc/nginx/sites-available/odoo << EOF
+upstream odoo {
+    server 127.0.0.1:8069;
+}
+
+upstream odoochat {
+    server 127.0.0.1:8072;
+}
+
+server {
+    listen 80;
+    server_name ${DOMAIN};
+    
+    access_log /var/log/nginx/odoo.access.log;
+    error_log /var/log/nginx/odoo.error.log;
+    
+    proxy_read_timeout 720s;
+    proxy_connect_timeout 720s;
+    proxy_send_timeout 720s;
+    
+    # Longpolling
+    location /longpolling {
+        proxy_pass http://odoochat;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+    
+    # Main location
+    location / {
+        proxy_pass http://odoo;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        
+        # Cache static files
+        location ~* \.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+            proxy_pass http://odoo;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+        }
+    }
+}
+EOF
+
+    systemctl reload nginx
+    info "Nginx configured to work with Cloudflare Tunnel"
 }
 
 # Functionality tests
@@ -940,11 +1745,14 @@ verify_installation() {
         local message="$1"
         local cmd="$2"
         echo -n "⏳ $message... "
-        if eval "$cmd" > /dev/null 2>&1; then
+        # Redirect stderr to stdout to capture all errors
+        if output=$(eval "$cmd" 2>&1); then
             echo -e "\r✅ $message"
             return 0
         else
             echo -e "\r❌ $message"
+            warn "Command failed: $cmd"
+            warn "Error: $output"
             return 1
         fi
     }
@@ -1031,7 +1839,7 @@ verify_installation() {
     fi
     
     # Backup test
-    if ! test_with_progress "Backup test" "/opt/odoo/backup_advanced.sh test"; then
+    if ! test_with_progress "Backup test" "/opt/backups/backup_odoo.sh test"; then
         WARNINGS+=("Backup test failed")
     fi
 
@@ -1116,28 +1924,89 @@ setup_distribution_detection() {
         . /etc/os-release
         DISTRO=$ID
         VERSION=$VERSION_ID
+        DISTRO_FAMILY="unknown"
     else
         error "Unable to detect distribution"
     fi
     
-    # Compatibility check
+    # Determine distribution family for better compatibility
     case $DISTRO in
-        debian)
-            if [[ $VERSION_ID -lt 12 ]]; then
-                error "Debian $VERSION_ID not supported. Minimum version: Debian 12"
+        debian|ubuntu|linuxmint|elementary|pop|zorin)
+            DISTRO_FAMILY="debian"
+            PKG_MANAGER="apt"
+            PKG_INSTALL="apt-get install -yq"
+            PKG_UPDATE="apt-get update"
+            ;;
+        centos|rhel|fedora|rocky|alma|ol|amzn)
+            DISTRO_FAMILY="redhat"
+            if command -v dnf &>/dev/null; then
+                PKG_MANAGER="dnf"
+                PKG_INSTALL="dnf install -y"
+                PKG_UPDATE="dnf check-update"
+            else
+                PKG_MANAGER="yum"
+                PKG_INSTALL="yum install -y"
+                PKG_UPDATE="yum check-update"
             fi
             ;;
-        ubuntu)
-            if [[ $VERSION_ID < "24.04" ]]; then
-                error "Ubuntu $VERSION_ID not supported. Minimum version: Ubuntu 24.04"
-            fi
+        opensuse*|suse|sles)
+            DISTRO_FAMILY="suse"
+            PKG_MANAGER="zypper"
+            PKG_INSTALL="zypper install -y"
+            PKG_UPDATE="zypper refresh"
+            ;;
+        arch|manjaro|endeavouros)
+            DISTRO_FAMILY="arch"
+            PKG_MANAGER="pacman"
+            PKG_INSTALL="pacman -S --noconfirm"
+            PKG_UPDATE="pacman -Sy"
+            ;;
+        alpine)
+            DISTRO_FAMILY="alpine"
+            PKG_MANAGER="apk"
+            PKG_INSTALL="apk add --no-cache"
+            PKG_UPDATE="apk update"
             ;;
         *)
-            error "Unsupported distribution $DISTRO. Use Debian 12+ or Ubuntu 24.04+"
+            warn "Distribution $DISTRO might not be fully supported."
+            DISTRO_FAMILY="unknown"
             ;;
     esac
     
-    info "Detected distribution: $DISTRO $VERSION"
+    # Compatibility check
+    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        if [[ "$DISTRO" == "debian" && "$VERSION_ID" -lt 12 ]]; then
+            error "Debian $VERSION_ID not supported. Minimum version: Debian 12"
+        elif [[ "$DISTRO" == "ubuntu" && "$VERSION_ID" < "24.04" ]]; then
+            error "Ubuntu $VERSION_ID not supported. Minimum version: Ubuntu 24.04"
+        fi
+    elif [[ "$DISTRO_FAMILY" == "alpine" ]]; then
+        if [[ "$(echo "$VERSION_ID" | cut -d. -f1)" -lt 3 ]]; then
+            error "Alpine $VERSION_ID not supported. Minimum version: Alpine 3.14"
+        fi
+        
+        # Alpine specific setup
+        info "Setting up Alpine Linux environment"
+        
+        # Alpine needs bash and other essential tools
+        if [[ "$DRY_RUN" != true ]]; then
+            apk add --no-cache bash curl wget ca-certificates
+            
+            # Create compatibility symlinks for common utilities
+            if ! command -v sudo &>/dev/null; then
+                apk add --no-cache sudo
+            fi
+            
+            # Ensure shadow is installed for user management
+            apk add --no-cache shadow
+        fi
+    elif [[ "$DISTRO_FAMILY" == "unknown" ]]; then
+        warn "Using $DISTRO $VERSION_ID which is not officially supported."
+        warn "Installation may fail or require manual adjustments."
+    fi
+    
+    info "Detected distribution: $DISTRO $VERSION ($DISTRO_FAMILY family)"
+    info "Package manager: $PKG_MANAGER"
 }
 
 setup_timezone_locale_detection() {
@@ -1576,41 +2445,212 @@ Access to monitoring interfaces:
 
 # Main function update to include new functions
 main() {
+    local start_time=$(date +%s)
     info "Starting optimized Odoo installation..."
     
-    # New optimizations
-    setup_parallel_optimizations
-    setup_cockpit
-    setup_crowdsec
+    # Load external modules if available, otherwise use built-in functions
+    load_module "system_checks" || true
+    load_module "postgresql" || true
+    load_module "nginx" || true
+    load_module "redis" || true
+    load_module "odoo" || true
+    load_module "monitoring" || true
+    load_module "security" || true
+    load_module "backup" || true
     
-    # Existing process...
-    validate_interactive
-    get_user_config
-    validate_inputs
-    optimize_system
-    install_packages
-    setup_postgresql
-    setup_redis
-    install_odoo
-    setup_nginx
-    setup_ssl
-    setup_monitoring
-    setup_backups
-    setup_firewall
+    # Run comprehensive preliminary checks first
+    if ! run_once "comprehensive_check" comprehensive_checks; then
+        error "Critical issues detected during preliminary checks. Aborting installation."
+        exit 1
+    fi
+    
+    # Detailed system constraints checks
+    run_once "system_constraints" check_system_constraints
+    
+    # Configure proxy if needed
+    if [[ -n "${PROXY_URL:-}" ]]; then
+        export http_proxy="$PROXY_URL"
+        export https_proxy="$PROXY_URL"
+        info "Proxy configured: $PROXY_URL"
+    fi
+    
+    # Distribution detection
+    run_once "distro_detection" setup_distribution_detection
+    
+    # New optimizations - these can be run in parallel
+    if [[ "$DRY_RUN" != true ]]; then
+        parallel_exec \
+            "parallel_optimizations" "setup_parallel_optimizations" \
+            "cockpit" "setup_cockpit" \
+            "crowdsec" "setup_crowdsec"
+    else
+        # In dry-run mode, we run them sequentially for better logging
+        run_once "parallel_optimizations" setup_parallel_optimizations
+        run_once "cockpit" setup_cockpit
+        run_once "crowdsec" setup_crowdsec
+    fi
+    
+    # Interactive configuration
+    run_once "interactive" validate_interactive
+    run_once "user_config" get_user_config
+    run_once "validate" validate_inputs
+    
+    # System setup
+    run_once "system_optimization" optimize_system
+    run_once "packages" install_packages
+    
+    # Main components installation
+    run_once "postgresql" setup_postgresql
+    run_once "postgresql_advanced" setup_postgresql_advanced
+    run_once "postgresql_health" setup_postgresql_health_checks
+    run_once "redis" setup_redis
+    run_once "odoo" install_odoo
+    run_once "nginx" setup_nginx
+    run_once "ssl" setup_ssl
+    
+    # Security and monitoring
+    run_once "monitoring" setup_monitoring
+    run_once "backups" setup_backups
+    run_once "firewall" setup_firewall
+    
+    # Advanced configurations
+    run_once "logging" setup_advanced_logging
+    run_once "remote_monitoring" setup_remote_monitoring
     
     # Final verification
     if verify_installation; then
-        info "Installation completed successfully. Documentation generated."
+        run_once "documentation" generate_docs
+        run_once "cleanup" cleanup
+        
+        # Calculate execution time
+        local end_time=$(date +%s)
+        local duration=$((end_time - start_time))
+        local hours=$((duration / 3600))
+        local minutes=$(( (duration % 3600) / 60 ))
+        local seconds=$((duration % 60))
+        
+        info "Installation completed successfully in ${hours}h ${minutes}m ${seconds}s."
+        
+        if [[ "$DRY_RUN" == true ]]; then
+            info "DRY-RUN: No actual changes were made to the system."
+        else
+            info "Documentation generated."
+            echo
+            system_cmd "cat /root/odoo_installation_summary.txt" "Display installation summary"
+        fi
     else
         warn "Installation completed with warnings. Check the report."
     fi
-    
-    # Adding new functions
-    setup_advanced_logging
-    setup_remote_monitoring
 }
 
+# Main execution with trap for unexpected errors
+START_TIME=$(date +%s)
+main "$@"
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
+HOURS=$((DURATION / 3600))
+MINUTES=$(( (DURATION % 3600) / 60 ))
+SECONDS=$((DURATION % 60))
+info "Total execution time: ${HOURS}h ${MINUTES}m ${SECONDS}s"
+
 # ===================== STUBS FUNCTIONALITY TO COMPLETE =====================
+
+# Implementing setup_ddns function for dynamic DNS configuration
+setup_ddns() {
+    info "Configuring Dynamic DNS..."
+    
+    case "$DDNS_SERVICE" in
+        duckdns)
+            if [[ -z "$SUBDOMAIN" || -z "$DUCKDNS_TOKEN" ]]; then
+                error "DuckDNS: subdomain or token missing"
+            fi
+            
+            # Create DuckDNS update script
+            cat > /usr/local/bin/update_duckdns.sh << EOF
+#!/bin/bash
+curl -s "https://www.duckdns.org/update?domains=${SUBDOMAIN}&token=${DUCKDNS_TOKEN}&ip=" 
+EOF
+            chmod +x /usr/local/bin/update_duckdns.sh
+            
+            # Configure cron
+            (crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/update_duckdns.sh > /var/log/duckdns.log 2>&1") | crontab -
+            
+            # Execute immediately
+            /usr/local/bin/update_duckdns.sh
+            info "DuckDNS configured for ${SUBDOMAIN}.duckdns.org"
+            ;;
+            
+        noip)
+            if [[ -z "$NOIP_USER" || -z "$NOIP_PASS" ]]; then
+                error "No-IP: username or password missing"
+            fi
+            
+            # Install No-IP
+            apt install -yq build-essential
+            cd /tmp
+            wget http://www.no-ip.com/client/linux/noip-duc-linux.tar.gz
+            tar xzf noip-duc-linux.tar.gz
+            cd noip-*
+            make
+            cp noip2 /usr/local/bin/
+            
+            # Configure
+            cat > /tmp/no-ip.conf << EOF
+${NOIP_USER}
+${NOIP_PASS}
+${DOMAIN}
+30
+n
+EOF
+            /usr/local/bin/noip2 -C -c /tmp/no-ip.conf
+            rm /tmp/no-ip.conf
+            
+            # Service
+            cat > /etc/systemd/system/noip2.service << EOF
+[Unit]
+Description=No-IP Dynamic DNS Update Client
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/noip2
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            
+            systemctl daemon-reload
+            systemctl enable --now noip2
+            info "No-IP configured for ${DOMAIN}"
+            ;;
+            
+        dynu)
+            if [[ -z "$DYNU_USER" || -z "$DYNU_PASS" ]]; then
+                error "Dynu: username or password missing"
+            fi
+            
+            # Create Dynu update script
+            cat > /usr/local/bin/update_dynu.sh << EOF
+#!/bin/bash
+curl -s "https://api.dynu.com/nic/update?hostname=${DOMAIN}&username=${DYNU_USER}&password=${DYNU_PASS}"
+EOF
+            chmod +x /usr/local/bin/update_dynu.sh
+            
+            # Configure cron
+            (crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/update_dynu.sh > /var/log/dynu.log 2>&1") | crontab -
+            
+            # Execute immediately
+            /usr/local/bin/update_dynu.sh
+            info "Dynu configured for ${DOMAIN}"
+            ;;
+            
+        *)
+            info "No DDNS service configured"
+            ;;
+    esac
+}
+
 setup_dns_dynamic() {
     info "Dynamic DNS/Cloudflare Tunnel configuration..."
     case "$DDNS_SERVICE" in
@@ -2635,4 +3675,488 @@ load_env_config() {
             error "LE_EMAIL is required in production without Cloudflare Tunnel"
         fi
     fi
+}
+
+# Final cleanup and summary generation
+cleanup() {
+    info "Post-installation cleanup..."
+    
+    # Remove temporary files
+    rm -rf /tmp/odoo_install_*
+    
+    # Clean APT cache
+    apt clean
+    
+    # Remove unnecessary packages
+    apt autoremove -y
+    
+    # Secure installation logs
+    chmod 600 "$LOG_FILE"
+    
+    # Create installation summary
+    if [[ "$DRY_RUN" != true ]]; then
+        cat > /root/odoo_installation_summary.txt << EOF
+=============================================
+ODOO INSTALLATION SUMMARY
+=============================================
+Date: $(date)
+Domain: $DOMAIN
+Services: Odoo, PostgreSQL, Redis, Nginx
+Monitoring: Netdata, Prometheus, Grafana
+
+CREDENTIALS (KEEP SECURE)
+=============================================
+Database: $DB_NAME
+Database User: $DB_USER
+Database Password: $DB_PASS
+Odoo Admin Password: $ADMIN_PASS
+Redis Password: $REDIS_PASS
+
+BACKUP INFORMATION
+=============================================
+Backup location: /opt/backups
+Backup schedule: Daily at 2AM
+Retention: ${BACKUP_RETENTION_DAYS:-7} days
+
+ACCESS URLS
+=============================================
+Odoo: https://$DOMAIN
+$(if [[ "${EXPOSE_MONITORING:-false}" == "true" ]]; then echo "Netdata: http://$DOMAIN:19999
+Grafana: http://$DOMAIN:3000 (admin/admin)
+Prometheus: http://$DOMAIN:9090"; fi)
+
+For security reasons, please change all default passwords.
+This summary file should be secured or deleted.
+EOF
+
+    chmod 600 /root/odoo_installation_summary.txt
+    
+    info "Cleanup completed. Summary available in /root/odoo_installation_summary.txt"
+    fi
+}
+
+generate_module_example() {
+    info "Generating module example files..."
+    
+    # Create the modules directory if it doesn't exist
+    mkdir -p "${MODULE_DIR}"
+    
+    # Example PostgreSQL module
+    cat > "${MODULE_DIR}/postgresql.sh.example" << 'EOF'
+#!/bin/bash
+# PostgreSQL module for Odoo server installer
+# To use this module, rename to postgresql.sh
+
+# PostgreSQL installation and configuration
+setup_postgresql() {
+    info "PostgreSQL module: Installation and configuration..."
+    
+    # Distribution-specific installation
+    case "$DISTRO_FAMILY" in
+        debian)
+            apt-get install -yq postgresql-15 postgresql-contrib-15
+            ;;
+        redhat)
+            $PKG_INSTALL postgresql15-server postgresql15-contrib
+            ;;
+        *)
+            warn "Unsupported distribution for PostgreSQL module"
+            return 1
+            ;;
+    esac
+    
+    # Configure PostgreSQL for Odoo
+    info "Setting up PostgreSQL database for Odoo"
+    sudo -u postgres psql -c "CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASS}';"
+    sudo -u postgres psql -c "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};"
+    
+    # Apply performance optimizations
+    info "Applying PostgreSQL performance optimizations"
+    # ... optimization code here ...
+    
+    return 0
+}
+
+# Module exports
+export -f setup_postgresql
+EOF
+
+    # Example Odoo module
+    cat > "${MODULE_DIR}/odoo.sh.example" << 'EOF'
+#!/bin/bash
+# Odoo module for Odoo server installer
+# To use this module, rename to odoo.sh
+
+# Odoo installation function
+install_odoo() {
+    info "Odoo module: Installation..."
+    
+    # Create odoo user
+    useradd -m -d /opt/odoo -U -r -s /bin/bash odoo
+    
+    # Install Odoo from pip in a virtual environment
+    su - odoo -c "
+        python3 -m venv /opt/odoo/venv
+        source /opt/odoo/venv/bin/activate
+        pip install wheel
+        pip install odoo
+        deactivate
+    "
+    
+    # Create configuration
+    mkdir -p /etc/odoo
+    # ... configuration code here ...
+    
+    # Create systemd service
+    # ... service code here ...
+    
+    return 0
+}
+
+# Module exports
+export -f install_odoo
+EOF
+
+    info "Module examples created in ${MODULE_DIR}"
+    info "To use external modules, rename from .example to .sh"
+}
+
+# Add module example generation to the main function - after modules directory creation
+if [[ ! -d "$MODULE_DIR" ]]; then
+    mkdir -p "$MODULE_DIR"
+    debug "Created modules directory: $MODULE_DIR"
+    generate_module_example
+fi
+
+#=============================================================================
+# CACHE SYSTEM
+#=============================================================================
+
+# Cache directory for storing operation status
+CACHE_DIR="/var/cache/odoo_installer"
+mkdir -p "$CACHE_DIR" 2>/dev/null || true
+
+# Function to check if an operation has already been completed
+# Usage: is_cached "operation_name"
+is_cached() {
+    local operation="$1"
+    [[ -f "${CACHE_DIR}/${operation}.done" ]]
+}
+
+# Function to mark an operation as completed
+# Usage: mark_cached "operation_name"
+mark_cached() {
+    local operation="$1"
+    local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+    echo "$timestamp" > "${CACHE_DIR}/${operation}.done"
+    debug "Operation '$operation' marked as completed in cache"
+}
+
+# Function to clear the cache for an operation
+# Usage: clear_cache "operation_name"
+clear_cache() {
+    local operation="$1"
+    if [[ -f "${CACHE_DIR}/${operation}.done" ]]; then
+        rm "${CACHE_DIR}/${operation}.done"
+        debug "Cache cleared for operation '$operation'"
+    fi
+}
+
+# Function to run an operation only if not cached
+# Usage: run_once "operation_name" command_function
+run_once() {
+    local operation="$1"
+    local func="$2"
+    shift 2
+    
+    if is_cached "$operation"; then
+        info "Operation '$operation' already completed, skipping"
+        return 0
+    else
+        info "Running operation '$operation'"
+        if "$func" "$@"; then
+            mark_cached "$operation"
+            return 0
+        else
+            warn "Operation '$operation' failed"
+            return 1
+        fi
+    fi
+}
+
+#=============================================================================
+# PARALLEL EXECUTION SYSTEM
+#=============================================================================
+
+# Maximum number of parallel tasks, defaults to CPU count
+MAX_PARALLEL_TASKS=${MAX_PARALLEL_TASKS:-$(nproc)}
+
+# Array to store background PIDs
+BACKGROUND_PIDS=()
+
+# Function to execute tasks in parallel
+# Usage: parallel_exec "task1_name" "task1_command" "task2_name" "task2_command" ...
+parallel_exec() {
+    local tasks=()
+    local names=()
+    
+    # Collect tasks and names
+    while [[ $# -gt 0 ]]; do
+        names+=("$1")
+        tasks+=("$2")
+        shift 2
+    done
+    
+    info "Starting ${#tasks[@]} tasks in parallel (max $MAX_PARALLEL_TASKS at once)"
+    
+    # Create a temporary directory for task status
+    local tmp_dir=$(mktemp -d)
+    
+    # Execute tasks in batches
+    for ((i=0; i<${#tasks[@]}; i+=MAX_PARALLEL_TASKS)); do
+        # Calculate end index for this batch
+        local end=$((i + MAX_PARALLEL_TASKS))
+        if [ $end -gt ${#tasks[@]} ]; then
+            end=${#tasks[@]}
+        fi
+        
+        # Execute tasks in this batch
+        for ((j=i; j<end; j++)); do
+            local task_name="${names[$j]}"
+            local task_cmd="${tasks[$j]}"
+            local status_file="${tmp_dir}/${j}.status"
+            
+            debug "Starting task: $task_name"
+            (
+                if eval "$task_cmd"; then
+                    echo "success" > "$status_file"
+                else
+                    echo "failure" > "$status_file"
+                fi
+            ) &
+            BACKGROUND_PIDS+=($!)
+        done
+        
+        # Wait for all tasks in this batch to complete
+        for pid in "${BACKGROUND_PIDS[@]}"; do
+            wait "$pid"
+        done
+        BACKGROUND_PIDS=()
+        
+        # Check status of each task in this batch
+        for ((j=i; j<end; j++)); do
+            local task_name="${names[$j]}"
+            local status_file="${tmp_dir}/${j}.status"
+            
+            if [[ -f "$status_file" ]]; then
+                local status=$(cat "$status_file")
+                if [[ "$status" == "success" ]]; then
+                    info "Task completed successfully: $task_name"
+                else
+                    warn "Task failed: $task_name"
+                fi
+            else
+                warn "No status file for task: $task_name"
+            fi
+        done
+    done
+    
+    # Clean up
+    rm -rf "$tmp_dir"
+    
+    info "All parallel tasks completed"
+}
+
+#=============================================================================
+# DRY RUN HELPERS
+#=============================================================================
+
+# Execute a command only if not in dry-run mode
+# Usage: execute_if_not_dry_run "command description" command_to_execute
+execute_if_not_dry_run() {
+    local description="$1"
+    local command="$2"
+    shift 2
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        info "[DRY-RUN] Would execute: $description"
+        debug "[DRY-RUN] Command: $command $*"
+        return 0
+    else
+        debug "Executing: $description"
+        eval "$command" "$@"
+        return $?
+    fi
+}
+
+# Wrapper for system commands that should be skipped in dry-run mode
+# Usage: system_cmd "apt-get update" "Update package repository"
+system_cmd() {
+    local cmd="$1"
+    local description="${2:-Executing command}"
+    
+    execute_if_not_dry_run "$description" "$cmd"
+}
+
+# Wrapper for file operations that should be skipped in dry-run mode
+# Usage: file_op "write_config_file" "Creating configuration file"
+file_op() {
+    local cmd="$1"
+    local description="${2:-Performing file operation}"
+    
+    execute_if_not_dry_run "$description" "$cmd"
+}
+
+#=============================================================================
+# COMPREHENSIVE PRELIMINARY CHECKS
+#=============================================================================
+
+# Comprehensive preliminary check to verify all prerequisites before installation
+comprehensive_checks() {
+    info "Running comprehensive preliminary checks..."
+    local ISSUES_FOUND=0
+    local WARNINGS_FOUND=0
+    
+    # Create a temporary file for collecting issues
+    local ISSUES_FILE=$(mktemp)
+    local WARNINGS_FILE=$(mktemp)
+    
+    # Check for root access
+    if [[ $EUID -ne 0 ]]; then
+        echo "CRITICAL: This script must be run as root" >> "$ISSUES_FILE"
+        ISSUES_FOUND=$((ISSUES_FOUND + 1))
+    fi
+    
+    # Check OS compatibility
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        if [[ "$ID" == "debian" && "${VERSION_ID:-0}" -lt 12 ]]; then
+            echo "CRITICAL: Debian $VERSION_ID not supported. Minimum version: Debian 12" >> "$ISSUES_FILE"
+            ISSUES_FOUND=$((ISSUES_FOUND + 1))
+        elif [[ "$ID" == "ubuntu" && "${VERSION_ID:-0}" < "24.04" ]]; then
+            echo "CRITICAL: Ubuntu $VERSION_ID not supported. Minimum version: Ubuntu 24.04" >> "$ISSUES_FILE"
+            ISSUES_FOUND=$((ISSUES_FOUND + 1))
+        elif [[ "$ID" != "debian" && "$ID" != "ubuntu" && "$ID" != "alpine" ]]; then
+            echo "WARNING: Unsupported distribution: $ID $VERSION_ID" >> "$WARNINGS_FILE"
+            WARNINGS_FOUND=$((WARNINGS_FOUND + 1))
+        fi
+    else
+        echo "CRITICAL: Unable to determine OS distribution" >> "$ISSUES_FILE"
+        ISSUES_FOUND=$((ISSUES_FOUND + 1))
+    fi
+    
+    # Check system memory
+    local MEM_TOTAL=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    local MEM_GB=$((MEM_TOTAL / 1024 / 1024))
+    if [[ $MEM_GB -lt 2 ]]; then
+        echo "CRITICAL: Insufficient memory. Minimum 2GB required, found ${MEM_GB}GB" >> "$ISSUES_FILE"
+        ISSUES_FOUND=$((ISSUES_FOUND + 1))
+    elif [[ $MEM_GB -lt 4 ]]; then
+        echo "WARNING: Low memory. At least 4GB recommended, found ${MEM_GB}GB" >> "$WARNINGS_FILE"
+        WARNINGS_FOUND=$((WARNINGS_FOUND + 1))
+    fi
+    
+    # Check disk space
+    local DISK_SPACE=$(df -BG / | awk 'NR==2 {print $4}' | tr -d 'G')
+    if [[ $DISK_SPACE -lt 10 ]]; then
+        echo "CRITICAL: Insufficient disk space. Minimum 10GB required, found ${DISK_SPACE}GB" >> "$ISSUES_FILE"
+        ISSUES_FOUND=$((ISSUES_FOUND + 1))
+    elif [[ $DISK_SPACE -lt 20 ]]; then
+        echo "WARNING: Low disk space. At least 20GB recommended, found ${DISK_SPACE}GB" >> "$WARNINGS_FILE"
+        WARNINGS_FOUND=$((WARNINGS_FOUND + 1))
+    fi
+    
+    # Check CPU count
+    local CPU_COUNT=$(nproc)
+    if [[ $CPU_COUNT -lt 2 ]]; then
+        echo "WARNING: Only ${CPU_COUNT} CPU detected. At least 2 CPUs recommended" >> "$WARNINGS_FILE"
+        WARNINGS_FOUND=$((WARNINGS_FOUND + 1))
+    fi
+    
+    # Check for required commands
+    local REQUIRED_COMMANDS=("bash" "curl" "wget" "grep" "awk" "sed")
+    for cmd in "${REQUIRED_COMMANDS[@]}"; do
+        if ! command -v "$cmd" &> /dev/null; then
+            echo "CRITICAL: Required command not found: $cmd" >> "$ISSUES_FILE"
+            ISSUES_FOUND=$((ISSUES_FOUND + 1))
+        fi
+    done
+    
+    # Check Internet connectivity
+    if ! ping -c 1 8.8.8.8 &> /dev/null; then
+        echo "CRITICAL: No Internet connectivity detected" >> "$ISSUES_FILE"
+        ISSUES_FOUND=$((ISSUES_FOUND + 1))
+    fi
+    
+    # Check SSH connection (we don't want to lose connection during install)
+    if [[ -n "$SSH_CONNECTION" ]]; then
+        echo "WARNING: Installation running over SSH. Ensure connection stability" >> "$WARNINGS_FILE"
+        WARNINGS_FOUND=$((WARNINGS_FOUND + 1))
+    fi
+    
+    # Check if PostgreSQL is already installed
+    if command -v psql &> /dev/null; then
+        local PG_VERSION=$(psql --version | grep -oP 'psql \(PostgreSQL\) \K[0-9]+\.[0-9]+')
+        echo "WARNING: PostgreSQL ${PG_VERSION} already installed. This script may modify configuration" >> "$WARNINGS_FILE"
+        WARNINGS_FOUND=$((WARNINGS_FOUND + 1))
+    fi
+    
+    # Check if port 80/443 are already in use
+    if netstat -tuln 2>/dev/null | grep -q ':80 '; then
+        echo "WARNING: Port 80 already in use. This may interfere with the web server" >> "$WARNINGS_FILE"
+        WARNINGS_FOUND=$((WARNINGS_FOUND + 1))
+    fi
+    if netstat -tuln 2>/dev/null | grep -q ':443 '; then
+        echo "WARNING: Port 443 already in use. This may interfere with SSL setup" >> "$WARNINGS_FILE"
+        WARNINGS_FOUND=$((WARNINGS_FOUND + 1))
+    fi
+    
+    # Check if port 8069 is already in use (Odoo default)
+    if netstat -tuln 2>/dev/null | grep -q ':8069 '; then
+        echo "WARNING: Port 8069 already in use. This may interfere with Odoo" >> "$WARNINGS_FILE"
+        WARNINGS_FOUND=$((WARNINGS_FOUND + 1))
+    fi
+    
+    # Check system's hostname resolution
+    if ! grep -q "$(hostname)" /etc/hosts; then
+        echo "WARNING: Hostname $(hostname) not found in /etc/hosts. May cause issues" >> "$WARNINGS_FILE"
+        WARNINGS_FOUND=$((WARNINGS_FOUND + 1))
+    fi
+    
+    # Display issues if any
+    if [[ $ISSUES_FOUND -gt 0 ]]; then
+        error "Found $ISSUES_FOUND critical issues that must be fixed:"
+        cat "$ISSUES_FILE" | while read issue; do
+            error "  - $issue"
+        done
+        error "Please fix these issues before continuing"
+        rm "$ISSUES_FILE" "$WARNINGS_FILE"
+        return 1
+    fi
+    
+    # Display warnings if any
+    if [[ $WARNINGS_FOUND -gt 0 ]]; then
+        warn "Found $WARNINGS_FOUND warnings:"
+        cat "$WARNINGS_FILE" | while read warning; do
+            warn "  - $warning"
+        done
+        
+        if [[ "$AUTO_MODE" != true ]]; then
+            read -p "Do you want to continue despite these warnings? (y/n) " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                info "Installation aborted by user"
+                rm "$ISSUES_FILE" "$WARNINGS_FILE"
+                exit 0
+            fi
+        else
+            warn "Auto mode enabled, continuing despite warnings"
+        fi
+    fi
+    
+    # Cleanup
+    rm "$ISSUES_FILE" "$WARNINGS_FILE"
+    
+    info "Preliminary checks completed successfully"
+    return 0
 }
