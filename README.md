@@ -83,8 +83,8 @@ Welcome! This project provides an easy, reliable, and production-ready way to in
 you can change the langage but by default its in english 
 look on the repo to see whats available 
    ```bash
-   git clone https://github.com/XnsYT/odoo-server-installer-en.git
-   cd odoo-server-installer-en
+   git clone https://github.com/XnsYT/odoo-server-installer.git
+   cd odoo-server-installer
    chmod +x odoo-server-installer-en.sh
    sudo ./odoo-server-installer-en.sh
    ```
