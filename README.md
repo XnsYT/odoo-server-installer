@@ -1,0 +1,195 @@
+# Odoo 17 Automated Installer
+
+Welcome! This project provides an easy, reliable, and production-ready way to install Odoo 17 on your own server. Whether you're a business owner, developer, or sysadmin, this script helps you get Odoo up and running quickly, securely, and with best practices by default.
+
+---
+
+## Table of Contents
+
+1. [Installation Guide](#installation-guide)
+   - [Domain Configuration](#domain-configuration)
+   - [Server Installation](#server-installation)
+   - [Initial Setup](#initial-setup)
+
+2. [Access and Usage](#access-and-usage)
+   - [First Launch](#first-launch)
+   - [User Management](#user-management)
+   - [Initial Configuration](#initial-configuration)
+
+3. [Monitoring and Supervision](#monitoring-and-supervision)
+   - [Dashboards](#dashboards)
+   - [Alert System](#alert-system)
+   - [Log Management](#log-management)
+
+4. [E-commerce and Website](#e-commerce-and-website)
+   - [Design and Customization](#design-and-customization)
+   - [Payments and Orders](#payments-and-orders)
+   - [Mobile Version](#mobile-version)
+
+5. [Costs and Versions](#costs-and-versions)
+   - [Community Version](#community-version)
+   - [Enterprise Version](#enterprise-version)
+   - [Alternatives](#alternatives)
+
+6. [Security and Backups](#security-and-backups)
+   - [Data Protection](#data-protection)
+   - [Backup System](#backup-system)
+   - [Restore](#restore)
+
+7. [Documentation and Support](#documentation-and-support)
+   - [User Guides](#user-guides)
+   - [Technical Support](#technical-support)
+   - [Updates](#updates)
+
+---
+
+# Installation Guide
+
+## Domain Configuration
+
+1. Purchase a domain name (OVH, Gandi, Namecheap, Cloudflare, etc.)
+2. DNS Setup:
+   - Add an A record in your DNS zone
+   - Target = your server's public IP
+   - For dynamic IP: use DuckDNS or Cloudflare Tunnel
+
+## Server Installation
+
+1. Preparation:
+   ```bash
+   git clone https://github.com/XnsYT/odoo-server-installer.git
+   cd odoo-server-installer
+   chmod +x improved_odoo_install.sh
+   sudo ./improved_odoo_install.sh
+   ```
+
+2. The script will automatically configure:
+   - Nginx and SSL
+   - Database
+   - Security
+   - Monitoring
+   - Backups
+
+## Initial Setup
+
+1. Go to: https://your-domain
+2. Create your database
+3. Configure your company
+
+---
+
+# Access and Usage
+
+## First Launch
+- Database creation
+- Company configuration
+- Import initial data
+
+## User Management
+- Create user accounts
+- Assign permissions
+- Set up 2FA
+
+## Initial Configuration
+- Essential modules
+- System settings
+- Customization
+
+---
+
+# Monitoring and Supervision
+
+## Dashboards
+- Grafana: real-time metrics
+- Netdata: system performance
+- Prometheus: data collection
+
+## Alert System
+- Configurable notifications
+- Alert thresholds
+- Automated actions
+
+## Log Management
+- Centralized logs
+- Real-time analysis
+- History
+
+---
+
+# E-commerce and Website
+
+## Design and Customization
+- Professional themes
+- Advanced customization
+- Mobile adaptation
+
+## Payments and Orders
+- Secure payments
+- Order management
+- Stock tracking
+
+## Mobile Version
+- Native app
+- PWA
+- Optimized interface
+
+---
+
+# Costs and Versions
+
+## Community Version (Free)
+- Full features
+- No limitations
+- Community support
+
+## Enterprise Version
+- Additional features
+- Official support
+- Assisted migration
+
+## Alternatives
+- Community modules
+- Third-party integrations
+- Open source solutions
+
+---
+
+# Security and Backups
+
+## Data Protection
+- Encryption
+- Access control
+- Auditing
+
+## Backup System
+- Automated backups
+- Integrity checks
+- Configurable retention
+
+## Restore
+- Tested procedures
+- Restore points
+- Business continuity
+
+---
+
+# Documentation and Support
+
+## User Guides
+- Detailed procedures
+- Use cases
+- Best practices
+
+## Technical Support
+- Community forums
+- Knowledge base
+- Technical documentation
+
+## Updates
+- Security
+- Features
+- Compatibility
+
+---
+
+Thank you for checking out **odoo-server-installer**! If you have questions, ideas, or want to contribute, feel free to open an issue or pull request. Your feedback is welcome and helps make this project better for everyone.
