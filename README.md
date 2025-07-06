@@ -4,6 +4,30 @@ Welcome! This project provides an easy, reliable, and production-ready way to in
 
 ---
 
+## System Requirements & Monitoring Access
+
+**Supported Distributions:**
+- Debian 12 (Bookworm) and Ubuntu 24.04 LTS (Noble Numbat) are fully supported.
+- The script is designed for modern Debian-based distributions. Other Debian-based distros (like Ubuntu 22.04, Linux Mint, etc.) may work, but only Debian 12+ and Ubuntu 24.04+ are officially tested and recommended.
+
+**Recommended System:**
+- 4+ CPU cores (8+ recommended)
+- 16GB RAM minimum (64GB recommended)
+- 50GB+ SSD storage
+- Root access
+- A valid domain name
+
+**Monitoring URLs & Ports:**
+- **Odoo:**         `https://your-domain` (port 443)
+- **Grafana:**      `http://your-domain:3000` (port 3000)
+- **Netdata:**      `http://your-domain:19999` (port 19999)
+- **Prometheus:**   `http://your-domain:9090` (port 9090)
+- **Alertmanager:** `http://your-domain:9093` (port 9093)
+
+> All monitoring dashboards are protected by authentication and/or firewall rules by default. Please change default passwords after installation.
+
+---
+
 ## Table of Contents
 
 1. [Installation Guide](#installation-guide)
