@@ -80,11 +80,13 @@ Welcome! This project provides an easy, reliable, and production-ready way to in
 ## Server Installation
 
 1. Preparation:
+you can change the langage but by default its in english 
+look on the repo to see whats available 
    ```bash
-   git clone https://github.com/XnsYT/odoo-server-installer.git
-   cd odoo-server-installer
-   chmod +x improved_odoo_install.sh
-   sudo ./improved_odoo_install.sh
+   git clone https://github.com/XnsYT/odoo-server-installer-en.git
+   cd odoo-server-installer-en
+   chmod +x odoo-server-installer-en.sh
+   sudo ./odoo-server-installer-en.sh
    ```
 
 2. The script will automatically configure:
