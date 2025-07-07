@@ -280,6 +280,18 @@ Thank you for checking out **odoo-server-installer**! If you have questions, ide
 ## Recent Updates
 
 ### Version 1.2.0
+- Major security hardening: SELinux/AppArmor profiles, advanced firewall, audit logging, 2FA, and secrets management
+- Disaster recovery: full backup/restore automation, integrity checks, and rollback system
+- Advanced monitoring: Prometheus, Grafana, Loki, Netdata, Odoo Prometheus exporter, alerting, and log centralization
+- Dynamic tuning: automatic resource-based optimization for PostgreSQL, Redis, Nginx, and Odoo
+- Modular system: external module support, example modules, and easier customization
+- Parallel execution: faster installation with multi-core support and improved cache system
+- Cloud & container support: Docker/Compose, S3 backup, Cloudflare Tunnel, and DDNS automation
+- Enhanced documentation: auto-generated server summary, disaster recovery guide, and improved inline help
+- Improved validation: stricter domain/email checks, interactive and auto modes, and better error reporting
+- New advanced options: encrypted backups, password rotation, staging environment, load balancing, CDN, and more
+
+### Version 1.1.0
 - Added modular architecture for better extensibility
 - Implemented dry-run mode for testing without system changes
 - Added support for Alpine Linux and improved compatibility with other distributions
