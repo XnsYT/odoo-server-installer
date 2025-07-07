@@ -90,8 +90,8 @@ Welcome! This project provides an easy, reliable, and production-ready way to in
 1. Preparation:
 
    ```bash
-   git clone https://github.com/XnsYT/odoo-server-installer.git
-   cd odoo-server-installer
+   git clone https://github.com/XnsYT/odoo-automated-server-installer.git
+   cd odoo-automated-server-installer
    chmod +x odoo-server-installer-en.sh
    sudo ./odoo-server-installer-en.sh
    ```
