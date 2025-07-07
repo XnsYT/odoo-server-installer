@@ -2,7 +2,7 @@
 # Optimized Odoo 17 installation script - Debian 12/Ubuntu 24.04 - 64GB RAM
 # Refactored version: structured logging, rollback, strict validation, modularity, enhanced security
 # Version: 1.1.0
-# Date: 2023-10-01
+# Date: 2025-07-07
 
 set -euo pipefail
 trap 'echo "Error at line $LINENO. Script aborted." >&2; exit 1' ERR
