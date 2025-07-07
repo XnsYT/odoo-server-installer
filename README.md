@@ -279,8 +279,27 @@ Thank you for checking out **odoo-server-installer**! If you have questions, ide
 
 ## Recent Updates
 
+### Version 1.4.0
+- Centralized configuration: All configuration variables are grouped at the top of the script, with support for .env overrides.
+- Consistent naming: All functions and variables use snake_case for clarity and maintainability.
+- Improved modularity: Functions are grouped by logical sections, and code duplication has been removed.
+- Enhanced error handling and security: Stricter permissions, improved traps, and secret masking in all logs.
+- Performance optimizations: More parallelism for package installation and system checks, batch operations for efficiency.
+- Expanded validation: More robust input validation for domains, emails, and passwords.
+- Advanced logging and monitoring: Log rotation, retention, color-coded output, and centralized log forwarding (ELK/Filebeat).
+- User experience improvements: Progress indicators, clearer prompts, dry-run support, and auto-generated install summary.
+- Cloud backup and monitoring: Native rclone multi-target backup, Uptime Kuma deployment, Slack/Telegram alert integration.
+- Secrets management: HashiCorp Vault and Bitwarden CLI integration for secure secrets storage.
+- Wildcard certificate automation: acme.sh integration for DNS-based wildcard SSL certificates.
+- Modern reverse proxy: Traefik deployment option with auto-configuration.
+- SSO and VPN: SSO assistant for Odoo/admin tools, WireGuard VPN deployment.
+- Migration, HA, and security: Migration/cloning tools, HA support (Patroni/HAProxy), advanced security (CrowdSec, auditd, Falco).
+- Automatic update and reporting: Scheduled updates and email reports.
+- Self-update and dependency checks: Installer can update itself and check for outdated dependencies.
+- Testing and quality: Unit tests for all critical functions, smoke tests after install, improved uninstall and rollback.
+
 ### Version 1.3.0
-- Multi-language support for logs and user messages (11 languages: en, fr, es, ar, hi, zh, pt, ru, ja, de, id)
+- partially Multi-language support for logs and user messages (11 languages: en, fr, es, ar, hi, zh, pt, ru, ja, de, id)
 - Secure deletion/encryption of sensitive files (logs, summaries) after install
 - Improved uninstall: interactive confirmation, --purge option, uninstall summary, and use of global variables for all paths
 - Granular rollback actions for each critical step

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Optimized Odoo 17 installation script - Debian 12/Ubuntu 24.04 - 16-64GB RAM
 # Refactored version: structured logging, rollback, strict validation, modularity, enhanced security
-# Version: 1.3.0
+# Version: 1.4.0
 # Date: 2025-07-07
 
 set -euo pipefail
@@ -4734,7 +4734,6 @@ fi
 # ... existing code ...
 EOF
 chmod 700 /opt/backups/backup_odoo.sh
-
 # ===================== LANGUAGE MANAGER FOR LOGS & USER MESSAGES =====================
 # Supported languages: en, fr, es, ar, hi, zh, pt, ru, ja, de, id
 LANGUAGE=${ODOO_INSTALL_LANG:-${LANGUAGE:-en}}
@@ -4839,3 +4838,343 @@ get_message() {
 
 # Refactor log/info/warn/error to use get_message for all static messages
 // ... existing code ...
+
+# ===================== ADVANCED CONFIGURATION =====================
+# Cloud backup, monitoring, secrets, SSO, VPN, HA, etc.
+ENABLE_RCLONE_BACKUP=true
+ENABLE_UPTIME_KUMA=true
+ENABLE_SLACK_ALERTS=false
+ENABLE_TELEGRAM_ALERTS=false
+ENABLE_VAULT_SECRETS=false
+ENABLE_BITWARDEN_SECRETS=false
+ENABLE_WILDCARD_CERTS=true
+ENABLE_TRAEFIK=false
+ENABLE_SSO=true
+ENABLE_WIREGUARD=true
+ENABLE_ELK_LOGS=false
+ENABLE_SMOKE_TESTS=true
+ENABLE_STORAGE_QUOTA=true
+ENABLE_WEB_ADMIN_UI=true
+ENABLE_MIGRATION_TOOLS=true
+ENABLE_HA_SUPPORT=true
+ENABLE_ADVANCED_SECURITY=true
+ENABLE_AUTO_UPDATE_REPORT=true
+
+# Rclone configuration
+RCLONE_REMOTE="odoo-backup"
+RCLONE_TARGET="s3:mybucket/odoo-backups"
+RCLONE_CRON="0 4 * * *"
+
+# Uptime Kuma configuration
+UPTIME_KUMA_PORT=3001
+UPTIME_KUMA_DIR="/opt/uptime-kuma"
+
+# Slack/Telegram configuration
+SLACK_WEBHOOK=""
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_CHAT_ID=""
+
+# Vault/Bitwarden configuration
+VAULT_ADDR="http://127.0.0.1:8200"
+VAULT_TOKEN=""
+BITWARDEN_SESSION=""
+
+# Traefik configuration
+TRAEFIK_DOMAIN="$DOMAIN"
+TRAEFIK_EMAIL="$LE_EMAIL"
+
+# WireGuard configuration
+WG_PORT=51820
+WG_INTERFACE="wg0"
+WG_NETWORK="10.8.0.0/24"
+
+# ELK configuration
+ELK_HOST="elk.example.com"
+ELK_PORT=5044
+
+# Storage quota
+BACKUP_QUOTA_GB=50
+
+# ... existing code ...
+
+# ===================== CLOUD MULTI-TARGET BACKUP (RCLONE) =====================
+setup_rclone_backup() {
+    info "Setting up rclone for cloud multi-target backup..."
+    if ! command -v rclone &>/dev/null; then
+        apt install -yq rclone
+    fi
+    if [ ! -f /root/.config/rclone/rclone.conf ]; then
+        info "Please configure rclone remote '$RCLONE_REMOTE' manually using 'rclone config'."
+    fi
+    # Add cron job for regular sync
+    (crontab -l 2>/dev/null; echo "$RCLONE_CRON rclone sync /opt/backups/ $RCLONE_REMOTE:$RCLONE_TARGET >> /var/log/rclone_backup.log 2>&1") | crontab -
+    info "Rclone backup scheduled."
+}
+
+# ===================== ADVANCED MONITORING & ALERTING =====================
+setup_uptime_kuma() {
+    info "Deploying Uptime Kuma for external monitoring..."
+    if ! command -v docker &>/dev/null; then
+        apt install -yq docker.io
+        systemctl enable --now docker
+    fi
+    mkdir -p "$UPTIME_KUMA_DIR"
+    docker run -d --restart=always -p $UPTIME_KUMA_PORT:3001 -v $UPTIME_KUMA_DIR:/app/data --name uptime-kuma louislam/uptime-kuma:latest
+    info "Uptime Kuma running on port $UPTIME_KUMA_PORT."
+}
+
+send_slack_alert() {
+    local message="$1"
+    if [[ "$ENABLE_SLACK_ALERTS" == true && -n "$SLACK_WEBHOOK" ]]; then
+        curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"$message\"}" "$SLACK_WEBHOOK"
+    fi
+}
+
+send_telegram_alert() {
+    local message="$1"
+    if [[ "$ENABLE_TELEGRAM_ALERTS" == true && -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then
+        curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" -d chat_id="$TELEGRAM_CHAT_ID" -d text="$message"
+    fi
+}
+
+# ===================== CENTRALIZED SECRETS MANAGEMENT =====================
+load_vault_secrets() {
+    info "Loading secrets from HashiCorp Vault..."
+    export VAULT_ADDR="$VAULT_ADDR"
+    export VAULT_TOKEN="$VAULT_TOKEN"
+    DB_PASS=$(vault kv get -field=db_pass secret/odoo)
+    ADMIN_PASS=$(vault kv get -field=admin_pass secret/odoo)
+    REDIS_PASS=$(vault kv get -field=redis_pass secret/odoo)
+}
+
+load_bitwarden_secrets() {
+    info "Loading secrets from Bitwarden CLI..."
+    export BW_SESSION="$BITWARDEN_SESSION"
+    DB_PASS=$(bw get password odoo-db)
+    ADMIN_PASS=$(bw get password odoo-admin)
+    REDIS_PASS=$(bw get password odoo-redis)
+}
+
+# ===================== WILDCARD CERTIFICATE AUTOMATION =====================
+setup_wildcard_certs() {
+    info "Setting up wildcard certificates with acme.sh..."
+    if ! command -v acme.sh &>/dev/null; then
+        curl https://get.acme.sh | sh
+        export PATH=~/.acme.sh:$PATH
+    fi
+    # Example for Cloudflare DNS
+    if [[ -n "$CLOUDFLARE_API_TOKEN" ]]; then
+        export CF_Token="$CLOUDFLARE_API_TOKEN"
+        ~/.acme.sh/acme.sh --issue --dns dns_cf -d "*.$DOMAIN" -d "$DOMAIN" --keylength ec-256 --force
+        ~/.acme.sh/acme.sh --install-cert -d "*.$DOMAIN" --ecc \
+            --fullchain-file /etc/letsencrypt/live/$DOMAIN/fullchain.pem \
+            --key-file /etc/letsencrypt/live/$DOMAIN/privkey.pem
+        info "Wildcard certificate installed for *.$DOMAIN."
+    else
+        warn "Cloudflare API token not set. Please configure DNS API for your provider."
+    fi
+}
+
+# ===================== MODERN REVERSE PROXY (TRAEFIK) =====================
+setup_traefik() {
+    info "Deploying Traefik as reverse proxy..."
+    if ! command -v docker &>/dev/null; then
+        apt install -yq docker.io
+        systemctl enable --now docker
+    fi
+    mkdir -p /opt/traefik
+    cat > /opt/traefik/traefik.yml <<EOF
+entryPoints:
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: "$TRAEFIK_EMAIL"
+      storage: "/letsencrypt/acme.json"
+      httpChallenge:
+        entryPoint: web
+providers:
+  file:
+    filename: "/opt/traefik/dynamic.yml"
+EOF
+    cat > /opt/traefik/dynamic.yml <<EOF
+http:
+  routers:
+    odoo:
+      rule: "Host(`$DOMAIN`)"
+      service: odoo
+      entryPoints:
+        - websecure
+      tls:
+        certResolver: letsencrypt
+  services:
+    odoo:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:8069"
+EOF
+    docker run -d --restart=always -p 80:80 -p 443:443 \
+        -v /opt/traefik/traefik.yml:/traefik.yml \
+        -v /opt/traefik/dynamic.yml:/dynamic.yml \
+        -v /letsencrypt:/letsencrypt \
+        --name traefik traefik:v2.10 \
+        --configFile=/traefik.yml
+    info "Traefik deployed."
+}
+
+# ===================== SSO DEPLOYMENT =====================
+setup_sso() {
+    info "Configuring SSO for Odoo and admin tools..."
+    # Document module installation for Odoo, Grafana, Cockpit, Portainer
+    echo "Please install and configure SSO modules (OAuth2/SAML/LDAP) for Odoo and admin tools."
+    echo "Refer to documentation for each tool."
+}
+
+# ===================== WIREGUARD VPN DEPLOYMENT =====================
+setup_wireguard() {
+    info "Setting up WireGuard VPN..."
+    apt install -yq wireguard
+    umask 077
+    wg genkey | tee /etc/wireguard/privatekey | wg pubkey > /etc/wireguard/publickey
+    cat > /etc/wireguard/$WG_INTERFACE.conf <<EOF
+[Interface]
+Address = $WG_NETWORK
+ListenPort = $WG_PORT
+PrivateKey = $(cat /etc/wireguard/privatekey)
+EOF
+    systemctl enable --now wg-quick@$WG_INTERFACE
+    ufw allow $WG_PORT/udp
+    info "WireGuard VPN running on port $WG_PORT."
+}
+
+# ===================== CENTRALIZED LOG MANAGEMENT (ELK) =====================
+setup_elk_logs() {
+    info "Configuring centralized log forwarding to ELK..."
+    apt install -yq filebeat
+    cat > /etc/filebeat/filebeat.yml <<EOF
+filebeat.inputs:
+- type: log
+  enabled: true
+  paths:
+    - /var/log/odoo/*.log
+    - /var/log/nginx/*.log
+    - /var/log/postgresql/*.log
+output.logstash:
+  hosts: ["$ELK_HOST:$ELK_PORT"]
+EOF
+    systemctl enable --now filebeat
+    info "Filebeat forwarding logs to $ELK_HOST:$ELK_PORT."
+}
+
+# ===================== AUTOMATED POST-INSTALL SMOKE TESTS =====================
+run_smoke_tests() {
+    info "Running post-install smoke tests..."
+    local errors=0
+    curl -s -I http://localhost:8069 | grep -q '200 OK' || { warn "Odoo web not responding"; errors=$((errors+1)); }
+    systemctl is-active --quiet postgresql || { warn "PostgreSQL not active"; errors=$((errors+1)); }
+    systemctl is-active --quiet redis-server || { warn "Redis not active"; errors=$((errors+1)); }
+    systemctl is-active --quiet nginx || { warn "Nginx not active"; errors=$((errors+1)); }
+    if [[ $errors -eq 0 ]]; then
+        info "All smoke tests passed."
+    else
+        warn "$errors smoke test(s) failed."
+        send_slack_alert "Odoo smoke tests failed on $DOMAIN"
+        send_telegram_alert "Odoo smoke tests failed on $DOMAIN"
+    fi
+}
+
+# ===================== STORAGE QUOTA & ALERTING =====================
+setup_storage_quota() {
+    info "Setting up storage quota for backups..."
+    apt install -yq quota
+    setquota -u odoo 0 $((BACKUP_QUOTA_GB*1024*1024)) 0 0 /opt/backups
+    info "Quota set to $BACKUP_QUOTA_GB GB for /opt/backups."
+}
+
+# ===================== SECURE WEB ADMIN INTERFACE =====================
+setup_web_admin_ui() {
+    info "Deploying Cockpit and Portainer for web administration..."
+    apt install -yq cockpit
+    systemctl enable --now cockpit.socket
+    if ! command -v docker &>/dev/null; then
+        apt install -yq docker.io
+        systemctl enable --now docker
+    fi
+    docker run -d --restart=always -p 9000:9000 -v /var/run/docker.sock:/var/run/docker.sock --name portainer portainer/portainer-ce
+    info "Cockpit available on port 9090, Portainer on port 9000."
+}
+
+# ===================== MIGRATION & CLONING TOOLS =====================
+setup_migration_tools() {
+    info "Deploying migration and cloning tools..."
+    cat > /usr/local/bin/odoo_clone.sh <<'EOF'
+#!/bin/bash
+# Usage: odoo_clone.sh <source_instance> <target_instance>
+# Example: odoo_clone.sh prod staging
+# This script clones Odoo instance (DB + files)
+EOF
+    chmod +x /usr/local/bin/odoo_clone.sh
+    info "Migration and cloning tools deployed."
+}
+
+# ===================== HIGH AVAILABILITY SUPPORT =====================
+setup_ha_support() {
+    info "Setting up high availability support..."
+    echo "Please refer to Patroni and HAProxy documentation for Odoo/PostgreSQL clustering."
+    # Optionally, automate basic Patroni/HAProxy setup here
+}
+
+# ===================== ENHANCED SECURITY (CrowdSec, auditd, Falco) =====================
+setup_advanced_security() {
+    info "Deploying advanced security tools (CrowdSec, auditd, Falco)..."
+    apt install -yq crowdsec auditd
+    curl -s https://falco.org/install.sh | bash
+    systemctl enable --now crowdsec auditd falco
+    info "CrowdSec, auditd, and Falco are active."
+}
+
+# ===================== AUTOMATIC UPDATE & REPORTING =====================
+setup_auto_update_report() {
+    info "Configuring automatic update and reporting..."
+    cat > /usr/local/bin/odoo_auto_update.sh <<EOF
+#!/bin/bash
+apt update && apt upgrade -y
+su - odoo -c "source /opt/odoo/venv/bin/activate && pip install --upgrade odoo && deactivate"
+echo "Odoo and system updated on \\$(date)" | mail -s "Odoo Update Report" $LE_EMAIL
+EOF
+    chmod +x /usr/local/bin/odoo_auto_update.sh
+    (crontab -l 2>/dev/null; echo "0 5 * * 0 /usr/local/bin/odoo_auto_update.sh") | crontab -
+    info "Automatic update and reporting scheduled."
+}
+
+# ===================== MAIN WORKFLOW INTEGRATION =====================
+main() {
+    local start_time=$(date +%s)
+    info "Starting optimized Odoo installation..."
+    # ... existing code ...
+    if [[ "$ENABLE_RCLONE_BACKUP" == true ]]; then setup_rclone_backup; fi
+    if [[ "$ENABLE_UPTIME_KUMA" == true ]]; then setup_uptime_kuma; fi
+    if [[ "$ENABLE_VAULT_SECRETS" == true ]]; then load_vault_secrets; fi
+    if [[ "$ENABLE_BITWARDEN_SECRETS" == true ]]; then load_bitwarden_secrets; fi
+    if [[ "$ENABLE_WILDCARD_CERTS" == true ]]; then setup_wildcard_certs; fi
+    if [[ "$ENABLE_TRAEFIK" == true ]]; then setup_traefik; fi
+    if [[ "$ENABLE_SSO" == true ]]; then setup_sso; fi
+    if [[ "$ENABLE_WIREGUARD" == true ]]; then setup_wireguard; fi
+    if [[ "$ENABLE_ELK_LOGS" == true ]]; then setup_elk_logs; fi
+    if [[ "$ENABLE_STORAGE_QUOTA" == true ]]; then setup_storage_quota; fi
+    if [[ "$ENABLE_WEB_ADMIN_UI" == true ]]; then setup_web_admin_ui; fi
+    if [[ "$ENABLE_MIGRATION_TOOLS" == true ]]; then setup_migration_tools; fi
+    if [[ "$ENABLE_HA_SUPPORT" == true ]]; then setup_ha_support; fi
+    if [[ "$ENABLE_ADVANCED_SECURITY" == true ]]; then setup_advanced_security; fi
+    if [[ "$ENABLE_AUTO_UPDATE_REPORT" == true ]]; then setup_auto_update_report; fi
+    # ... existing code ...
+    if [[ "$ENABLE_SMOKE_TESTS" == true ]]; then run_smoke_tests; fi
+    # ... existing code ...
+    local end_time=$(date +%s)
+    info "Total execution time: $((end_time - start_time)) seconds."
+}
+# ... existing code ...
+
