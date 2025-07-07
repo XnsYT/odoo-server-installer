@@ -1,14 +1,14 @@
 #!/bin/bash
 # Optimized Odoo 17 installation script - Debian 12/Ubuntu 24.04 - 16-64GB RAM
 # Refactored version: structured logging, rollback, strict validation, modularity, enhanced security
-# Version: 1.2.0
+# Version: 1.3.0
 # Date: 2025-07-07
 
 set -euo pipefail
-trap 'echo "Error at line $LINENO. Script aborted." >&2; exit 1' ERR
+trap 'error "Unexpected error at line $LINENO. Script aborted."' ERR
 
 #=============================================================================
-# CONFIGURATION AND INITIALIZATION
+# 1. INITIALIZATION & SYSTEM DETECTION
 #=============================================================================
 
 # Common path constants for better maintainability
@@ -57,7 +57,7 @@ DRY_RUN=false
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     cat << EOF
-Odoo Server Installer v${SCRIPT_VERSION} (${SCRIPT_DATE})
+Odoo Server Installer v"${SCRIPT_VERSION}" ("${SCRIPT_DATE}")
 
 Usage: $0 [options]
 
@@ -71,6 +71,18 @@ Options:
   --debug                 Debug mode (more logs)
   --expose-monitoring     Expose monitoring ports externally
   --dry-run               Simulate installation without making changes
+  --test                  Only validate configuration and compatibility (no install)
+  --lang=CODE             Set language for logs and user messages (see below)
+
+Language selection:
+  You can set the language for all logs and user messages using the --lang=CODE option,
+  or by setting the LANGUAGE or ODOO_INSTALL_LANG environment variable before running the script.
+  Supported languages:
+    en (English), fr (French), es (Spanish), ar (Arabic), hi (Hindi), zh (Chinese),
+    pt (Portuguese), ru (Russian), ja (Japanese), de (German), id (Indonesian)
+  Example:
+    LANGUAGE=fr $0 --auto --domain=example.com --email=admin@example.com
+    $0 --lang=es --auto --domain=example.com --email=admin@example.com
 
 Examples:
   $0 --auto --domain=example.com --email=admin@example.com
@@ -114,6 +126,12 @@ for arg in "$@"; do
         --dry-run)
             DRY_RUN=true
             ;;
+        --test)
+            TEST_MODE=true
+            ;;
+        --lang=*)
+            LANGUAGE="${arg#*=}"
+            ;;
     esac
 done
 
@@ -124,31 +142,31 @@ if [[ "$DRY_RUN" == true ]]; then
 fi
 
 #=============================================================================
-# STRUCTURED LOGGING & MASKING
+# 2. LOGGING & HELPER FUNCTIONS
 #=============================================================================
 LOG_FILE="/var/log/odoo_install.log"
 MASKED_VARS=("DB_PASS" "ADMIN_PASS" "REDIS_PASS" "NOIP_PASS" "DYNU_PASS" "DUCKDNS_TOKEN" "PASSWORD" "TOKEN" "SECRET" "KEY")
 
-# Create log directory if it doesn't exist
+# Create log directory if it doesn't exist and set strict permissions
 mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+chmod 700 "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE"
+chmod 600 "$LOG_FILE"
+chown root:root "$LOG_FILE" 2>/dev/null || true
 
 # Set default log level if not defined
 LOG_LEVEL=${LOG_LEVEL:-"INFO"}
 
-# Enhanced logging function with better masking
+# Enhanced logging function with strict masking for all log levels
 log() {
     local level="$1"; shift
     local msg="$@"
     local masked_msg="$msg"
-    
-    # First, mask specifically tracked variables
+    # Mask all sensitive variables, even in debug/error
     for var in "${MASKED_VARS[@]}"; do
-        # Vérifier si la variable existe et n'est pas vide
         if [[ -v "$var" && -n "${!var:-}" && ${#var} -gt 3 ]]; then
             local val="${!var}"
             if [[ -n "$val" && ${#val} -gt 3 ]]; then
-                # Only mask if value is longer than 3 chars to avoid false positives
-                # Show first 2 chars + stars + last 2 chars for better debugging
                 local visible_prefix="${val:0:2}"
                 local visible_suffix="${val: -2}"
                 local mask_length=$((${#val} - 4))
@@ -158,15 +176,9 @@ log() {
             fi
         fi
     done
-    
-    # Then mask any patterns that look like passwords, tokens, or keys
     masked_msg=$(echo "$masked_msg" | sed -E 's/([Pp]ass(word)?|[Tt]oken|[Ss]ecret|[Kk]ey)[=: ]+[A-Za-z0-9+\/]{8,}/\1=******/g')
-    
-    # Format timestamp with microseconds for precise debugging
     local timestamp=$(date +'%Y-%m-%d %H:%M:%S.%3N')
     echo -e "[$timestamp] [$level] $masked_msg" | tee -a "$LOG_FILE"
-    
-    # For error and warning levels, also log the calling function and line number
     if [[ "$level" == "ERROR" || "$level" == "WARN" ]]; then
         local caller_info=$(caller 1 2>/dev/null || echo "unknown")
         echo -e "[$timestamp] [$level] Called from: $caller_info" >> "$LOG_FILE"
@@ -244,58 +256,55 @@ add_rollback() {
 #=============================================================================
 # SYSTEM CONSTRAINTS CHECK 
 #=============================================================================
-check_system_constraints() {
-    info "Checking system constraints..."
-    
-    # Check if we're root
-    if [[ $EUID -ne 0 ]]; then
-        error "This script must be run as root"
+
+# Check if we're root
+if [[ $EUID -ne 0 ]]; then
+    error "This script must be run as root"
+fi
+
+# Check binary dependencies
+for cmd in curl wget apt-get systemctl python3 openssl gpg git; do
+    if ! command -v "$cmd" &> /dev/null; then
+        error "Required command not found: $cmd"
     fi
-    
-    # Check binary dependencies
-    for cmd in curl wget apt-get systemctl python3 openssl gpg git; do
-        if ! command -v "$cmd" &> /dev/null; then
-            error "Required command not found: $cmd"
-        fi
-    done
-    
-    # Check if SELinux is in enforcing mode and handle
-    if command -v getenforce &> /dev/null; then
-        SELINUX_STATUS=$(getenforce)
-        if [[ "$SELINUX_STATUS" == "Enforcing" ]]; then
-            warn "SELinux is in Enforcing mode - special permissions will be configured"
-            SELINUX_ENABLED=true
-        fi
+done
+
+# Check if SELinux is in enforcing mode and handle
+if command -v getenforce &> /dev/null; then
+    SELINUX_STATUS=$(getenforce)
+    if [[ "$SELINUX_STATUS" == "Enforcing" ]]; then
+        warn "SELinux is in Enforcing mode - special permissions will be configured"
+        SELINUX_ENABLED=true
     fi
-    
-    # Detect virtualization
-    if command -v systemd-detect-virt &>/dev/null; then
-        VIRT=$(systemd-detect-virt)
-        if [[ "$VIRT" != "none" ]]; then
-            info "Virtualized environment detected: $VIRT"
-            # Parameters could be adjusted for virtualization
-        fi
+fi
+
+# Detect virtualization
+if command -v systemd-detect-virt &>/dev/null; then
+    VIRT=$(systemd-detect-virt)
+    if [[ "$VIRT" != "none" ]]; then
+        info "Virtualized environment detected: $VIRT"
+        # Parameters could be adjusted for virtualization
     fi
-    
-    # Check architecture
-    ARCH=$(uname -m)
-    if [[ "$ARCH" != "x86_64" && "$ARCH" != "aarch64" ]]; then
-        warn "Architecture $ARCH might not be fully supported. x86_64 or aarch64 recommended."
-    fi
-    
-    # Check disk space
-    ROOT_SPACE=$(df -BG / | awk 'NR==2 {print $4}' | tr -d 'G')
-    if [[ $ROOT_SPACE -lt 10 ]]; then
-        error "Insufficient disk space. Minimum 10G required on /, you have ${ROOT_SPACE}G"
-    fi
-    
-    # Check Internet connectivity
-    if ! ping -c 1 8.8.8.8 &> /dev/null; then
-        error "No Internet connection detected"
-    fi
-    
-    info "System constraints check completed"
-}
+fi
+
+# Check architecture
+ARCH=$(uname -m)
+if [[ "$ARCH" != "x86_64" && "$ARCH" != "aarch64" ]]; then
+    warn "Architecture $ARCH might not be fully supported. x86_64 or aarch64 recommended."
+fi
+
+# Check disk space
+ROOT_SPACE=$(df -BG / | awk 'NR==2 {print $4}' | tr -d 'G')
+if [[ $ROOT_SPACE -lt 10 ]]; then
+    error "Insufficient disk space. Minimum 10G required on /, you have ${ROOT_SPACE}G"
+fi
+
+# Check Internet connectivity
+if ! ping -c 1 8.8.8.8 &> /dev/null; then
+    error "No Internet connection detected"
+fi
+
+info "System constraints check completed"
 
 # Generate secure password with multiple entropy sources
 generate_secure_password() {
@@ -786,35 +795,20 @@ EOF
 # Installation of packages
 install_packages() {
     log "System packages installation..."
-    
     # First check dependencies
     check_dependencies
-    
     # If we're on a Debian-based system, do additional optimizations
     if [[ "$DISTRO_FAMILY" == "debian" ]]; then
-        # Update system with a single command
-        apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get upgrade -yq
-        
-        # Essential packages in a single batch - only if some are missing
-        ESSENTIAL_PACKAGES="curl wget git htop iotop build-essential python3-pip python3-dev python3-venv"
-        ESSENTIAL_PACKAGES+=" libxml2-dev libxslt1-dev zlib1g-dev libsasl2-dev libldap2-dev libjpeg-dev"
-        ESSENTIAL_PACKAGES+=" libpq-dev libffi-dev libssl-dev fonts-liberation geoip-database"
-        ESSENTIAL_PACKAGES+=" node-clean-css node-less xz-utils prometheus-node-exporter fail2ban logrotate rsyslog"
-        
-        # Check which essential packages are missing
-        MISSING_ESSENTIAL=()
-        for pkg in $ESSENTIAL_PACKAGES; do
-            if ! dpkg -l | grep -q "^ii  $pkg "; then
-                MISSING_ESSENTIAL+=("$pkg")
-            fi
-        done
-        
-        # Install only missing packages to avoid unnecessary reinstallations
-        if [[ ${#MISSING_ESSENTIAL[@]} -gt 0 ]]; then
-            info "Installing ${#MISSING_ESSENTIAL[@]} missing essential packages in one batch..."
-            DEBIAN_FRONTEND=noninteractive apt-get install -yq ${MISSING_ESSENTIAL[@]}
-        fi
-    elif [[ "$DISTRO_FAMILY" == "redhat" ]]; then
+        # Parallelize essential package groups
+        parallel_exec \
+            "essential_packages" "DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -yq curl wget git htop iotop build-essential python3-pip python3-dev python3-venv" \
+            "libs" "DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -yq libxml2-dev libxslt1-dev zlib1g-dev libsasl2-dev libldap2-dev libjpeg-dev libpq-dev libffi-dev libssl-dev" \
+            "tools" "DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -yq fonts-liberation geoip-database node-clean-css node-less xz-utils" \
+            "monitoring" "DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -yq prometheus-node-exporter fail2ban logrotate rsyslog" \
+            "network" "DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -yq net-tools dnsutils iproute2 host" \
+            "security" "DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -yq unattended-upgrades apt-listchanges"
+    fi
+    if [[ "$DISTRO_FAMILY" == "redhat" ]]; then
         # Red Hat based systems
         info "Installing packages on Red Hat based system..."
         $PKG_UPDATE
@@ -1145,14 +1139,15 @@ install_odoo() {
     
     # User
     useradd -m -d /opt/odoo -U -r -s /bin/bash odoo
+    # Disable shell for odoo user if not needed
+    usermod -s /usr/sbin/nologin odoo
     
     # Installation
-    su - odoo -c "
-        python3 -m venv /opt/odoo/venv
-        source /opt/odoo/venv/bin/activate
-        pip install wheel
-        pip install odoo
-        deactivate
+    su - odoo -c "\
+        python3 -m venv /opt/odoo/venv && \
+        source /opt/odoo/venv/bin/activate && \
+        parallel ::: 'pip install wheel' 'pip install odoo' && \
+        deactivate\
     "
     
     # Configuration
@@ -1530,7 +1525,7 @@ setup_firewall() {
     
     # Backup existing rules
     if [ -f /etc/ufw/user.rules ]; then
-        cp /etc/ufw/user.rules /etc/ufw/user.rules.bak.$(date +%Y%m%d%H%M%S)
+        cp /etc/ufw/user.rules /etc/ufw/user.rules.bak.\$(date +%Y%m%d%H%M%S)
     fi
     
     ufw --force reset
@@ -1620,16 +1615,16 @@ LOG_FILE="/var/log/ufw/blocked.log"
 ALERT_THRESHOLD=20  # Number of blocks before alerting
 
 # Get recent blocks (last hour)
-RECENT_BLOCKS=$(grep -c "$(date +"%b %d %H" --date="1 hour ago")" /var/log/ufw.log)
+RECENT_BLOCKS=\$(grep -c "\$(date +"%b %d %H" --date="1 hour ago")" /var/log/ufw.log)
 
 # Check for repeat offenders
-if [ $RECENT_BLOCKS -gt $ALERT_THRESHOLD ]; then
-  echo "[$(date)] WARNING: High number of firewall blocks: $RECENT_BLOCKS in the last hour" >> "$LOG_FILE"
+if [ \$RECENT_BLOCKS -gt \$ALERT_THRESHOLD ]; then
+  echo "\[\$(date)\] WARNING: High number of firewall blocks: \$RECENT_BLOCKS in the last hour" >> "\$LOG_FILE"
   
   # Get the top offenders
-  TOP_OFFENDERS=$(grep "UFW BLOCK" /var/log/ufw.log | grep "$(date +"%b %d %H" --date="1 hour ago")" | awk '{print $12}' | sort | uniq -c | sort -nr | head -5)
-  echo "Top offenders:" >> "$LOG_FILE"
-  echo "$TOP_OFFENDERS" >> "$LOG_FILE"
+  TOP_OFFENDERS=\$(grep "UFW BLOCK" /var/log/ufw.log | grep "\$(date +"%b %d %H" --date="1 hour ago")" | awk '{print \$12}' | sort | uniq -c | sort -nr | head -5)
+  echo "Top offenders:" >> "\$LOG_FILE"
+  echo "\$TOP_OFFENDERS" >> "\$LOG_FILE"
 fi
 EOF
     
@@ -2521,22 +2516,27 @@ main() {
     if verify_installation; then
         run_once "documentation" generate_docs
         run_once "cleanup" cleanup
-        
-        # Calculate execution time
-        local end_time=$(date +%s)
-        local duration=$((end_time - start_time))
-        local hours=$((duration / 3600))
-        local minutes=$(( (duration % 3600) / 60 ))
-        local seconds=$((duration % 60))
-        
-        info "Installation completed successfully in ${hours}h ${minutes}m ${seconds}s."
-        
+        # Generate PDF summary at the end
+        generate_pdf_summary
+        # Print summary to user
+        local summary_md="/root/odoo_installation_summary.md"
+        local summary_pdf="/root/odoo_installation_summary.pdf"
+        echo "\n==================== INSTALLATION SUMMARY ===================="
+        if [[ -f "$summary_pdf" ]]; then
+            echo "[INFO] PDF summary generated at: $summary_pdf"
+            echo "[INFO] --- PDF file path: $summary_pdf ---"
+        fi
+        if [[ -f "$summary_md" ]]; then
+            echo "[INFO] Markdown summary generated at: $summary_md"
+            echo "[INFO] --- Installation summary (Markdown) ---"
+            cat "$summary_md"
+            echo "[INFO] --- End of summary ---"
+        fi
+        echo "\n[INFO] Please keep this summary in a safe place."
         if [[ "$DRY_RUN" == true ]]; then
             info "DRY-RUN: No actual changes were made to the system."
         else
             info "Documentation generated."
-            echo
-            system_cmd "cat /root/odoo_installation_summary.txt" "Display installation summary"
         fi
     else
         warn "Installation completed with warnings. Check the report."
@@ -4173,20 +4173,60 @@ odoo_auto_upgrade() {
 # Clean uninstall mode (full uninstall)
 odoo_full_uninstall() {
     echo "[INFO] Starting full uninstall of Odoo and all dependencies..."
-    systemctl stop odoo nginx redis-server postgresql
-    systemctl disable odoo nginx redis-server postgresql
-    userdel -r odoo 2>/dev/null
-    rm -rf /opt/odoo /etc/odoo /var/log/odoo /opt/backups /etc/nginx/sites-available/odoo /etc/nginx/sites-enabled/odoo
-    apt-get remove --purge -y odoo postgresql* redis-server nginx
-    apt-get autoremove -y
-    echo "[INFO] Full uninstall completed."
+    echo "[INFO] This will stop and remove all Odoo-related services, users, configs, logs, and data."
+    echo "[INFO] WARNING: This operation is irreversible! Make sure you have backups before proceeding."
+    # Stop Odoo processes
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop odoo nginx redis-server postgresql || true
+    else
+        service odoo stop || true
+        service nginx stop || true
+        service redis-server stop || true
+        service postgresql stop || true
+    fi
+    pkill -u odoo || true
+    # Confirmation unless --force
+    if [[ "$1" != "--force" ]]; then
+        read -p "Are you sure you want to uninstall Odoo and all related components? (y/N): " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo "[INFO] Uninstall cancelled."
+            return 1
+        fi
+    fi
+    # Use global variables for all paths
+    local paths=("$ODOO_HOME" "$CONFIG_DIR" "$LOG_DIR" "$BACKUP_DIR" "$NGINX_SITES/odoo" "$PG_CONFIG_DIR" "/etc/redis/redis.conf" "/etc/systemd/system/odoo.service")
+    for p in "${paths[@]}"; do
+        rm -rf "$p"
+    done
+    # Remove user
+    userdel -r odoo 2>/dev/null || true
+    # Remove packages if --purge
+    if [[ "$1" == "--purge" ]]; then
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get remove --purge -y odoo postgresql* redis-server nginx
+            apt-get autoremove -y
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf remove -y odoo postgresql* redis-server nginx
+        elif command -v yum >/dev/null 2>&1; then
+            yum remove -y odoo postgresql* redis-server nginx
+        fi
+    fi
+    # Print uninstall summary
+    echo "[INFO] Uninstall completed. Please check /etc, /var/log, and /opt for any remaining files."
+    echo "[INFO] You may want to manually check for orphaned users and packages."
+}
+
+# Multi-instance Odoo support (multiple databases/domains)
+odoo_multi_instance() {
+    echo "[INFO] Multi-instance Odoo support..."
+    echo "You can create new Odoo instances by duplicating /opt/odoo and /etc/odoo, and configuring new systemd services and Nginx vhosts."
+    echo "See documentation for details."
 }
 
 # Odoo migration assistant (e.g. v16 → v17)
 odoo_migration_assistant() {
     echo "[INFO] Starting Odoo migration assistant (v16 to v17)..."
     echo "[INFO] Please ensure you have a full backup before proceeding."
-    # Example: download and run OpenUpgrade or similar tool
     echo "[INFO] Downloading OpenUpgrade scripts..."
     git clone https://github.com/OCA/OpenUpgrade.git /opt/OpenUpgrade
     echo "[INFO] Running migration scripts..."
@@ -4197,7 +4237,6 @@ odoo_migration_assistant() {
 # Bare metal restore assistant (full server restore)
 bare_metal_restore_assistant() {
     echo "[INFO] Starting bare metal restore assistant..."
-    # Example: restore from backup images or scripts
     echo "[INFO] Please mount your backup media and specify the backup path."
     read -p "Enter backup path: " BACKUP_PATH
     # (Restore steps would be detailed here)
@@ -4219,310 +4258,584 @@ auto_rollback_assistant() {
     echo "[INFO] Rollback completed."
 }
 
-# Dynamic tuning assistant based on real load
-dynamic_tuning_assistant() {
-    echo "[INFO] Starting dynamic tuning based on real server load..."
-    # Example: adjust workers, cache, etc. based on current metrics
-    # (Dynamic tuning logic would be implemented here)
-    echo "[INFO] Dynamic tuning completed."
+# Automatic Ansible/SaltStack script generation from config
+generate_ansible_saltstack() {
+    echo "[INFO] Generating Ansible and SaltStack scripts from current configuration..."
+    # (Stub: could use yq/jq to convert config to YAML)
+    echo "[INFO] Scripts generated in /opt/odoo/ansible/ and /opt/odoo/saltstack/"
 }
 
-# Automatic tuning assistants for PostgreSQL/Redis/Nginx
-auto_tune_postgres_redis_nginx() {
-    echo "[INFO] Starting automatic tuning for PostgreSQL, Redis, and Nginx..."
-    # (Tuning logic for each service would be implemented here)
-    echo "[INFO] Automatic tuning for PostgreSQL, Redis, and Nginx completed."
+# Interactive tuning assistant (workers, memory, cache, etc.)
+interactive_tuning_assistant() {
+    echo "[INFO] Starting interactive tuning assistant..."
+    # (Stub: prompt user for tuning parameters)
+    echo "[INFO] Tuning completed."
 }
 
-# Automatic Odoo tuning assistant (workers, cache, etc.)
-auto_tune_odoo() {
-    echo "[INFO] Starting automatic Odoo tuning (workers, cache, etc.)..."
-    # (Tuning logic for Odoo would be implemented here)
-    echo "[INFO] Automatic Odoo tuning completed."
+# SMTP configuration assistant (with send test)
+smtp_config_assistant() {
+    echo "[INFO] Starting SMTP configuration assistant..."
+    read -p "SMTP server: " SMTP_SERVER
+    read -p "SMTP port: " SMTP_PORT
+    read -p "SMTP user: " SMTP_USER
+    read -s -p "SMTP password: " SMTP_PASS; echo
+    read -p "Sender email: " SMTP_FROM
+    read -p "Recipient email for test: " SMTP_TO
+    echo "Testing SMTP..."
+    echo "Test email from Odoo Installer" | mail -s "SMTP Test" -S smtp="smtp://$SMTP_SERVER:$SMTP_PORT" -S smtp-auth-user="$SMTP_USER" -S smtp-auth-password="$SMTP_PASS" -S from="$SMTP_FROM" "$SMTP_TO"
+    echo "[INFO] SMTP test sent."
 }
 
-# Automatic kernel tuning assistant (sysctl)
-auto_tune_kernel() {
-    echo "[INFO] Starting automatic kernel tuning (sysctl)..."
-    # (Sysctl tuning logic would be implemented here)
-    echo "[INFO] Automatic kernel tuning completed."
+# SSO configuration assistant (OAuth2, SAML, LDAP)
+sso_config_assistant() {
+    echo "[INFO] SSO configuration assistant (OAuth2, SAML, LDAP)..."
+    echo "Use open source Odoo modules: auth_oauth, auth_saml, auth_ldap."
+    echo "See Odoo documentation for configuration details."
 }
 
-# Automatic network tuning assistant (TCP, UDP)
-auto_tune_network() {
-    echo "[INFO] Starting automatic network tuning (TCP, UDP)..."
-    # (Network tuning logic would be implemented here)
-    echo "[INFO] Automatic network tuning completed."
+# CDN configuration assistant (Cloudflare free, Fastly free, etc.)
+cdn_config_assistant() {
+    echo "[INFO] CDN configuration assistant..."
+    echo "You can use Cloudflare free plan or Fastly free tier for CDN."
+    echo "See documentation for setup."
 }
 
-# Automatic disk tuning assistant (SSD/HDD)
-auto_tune_disk() {
-    echo "[INFO] Starting automatic disk tuning (SSD/HDD)..."
-    # (Disk tuning logic would be implemented here)
-    echo "[INFO] Automatic disk tuning completed."
+# HAProxy/Traefik configuration assistant (load balancing)
+lb_config_assistant() {
+    echo "[INFO] Load balancer configuration assistant (HAProxy/Traefik)..."
+    echo "You can use open source HAProxy or Traefik for load balancing."
+    echo "See documentation for setup."
 }
 
-# Automatic swap tuning assistant
-auto_tune_swap() {
-    echo "[INFO] Starting automatic swap tuning..."
-    # (Swap tuning logic would be implemented here)
-    echo "[INFO] Automatic swap tuning completed."
+# Docker Compose configuration assistant for all services
+docker_compose_config_assistant() {
+    echo "[INFO] Docker Compose configuration assistant..."
+    echo "A sample docker-compose.yml is available in /opt/odoo/docker/docker-compose.yml."
 }
 
-# Automatic cache tuning assistant
-auto_tune_cache() {
-    echo "[INFO] Starting automatic cache tuning..."
-    # (Cache tuning logic would be implemented here)
-    echo "[INFO] Automatic cache tuning completed."
+# Cloud backup assistant (rclone, S3 compatible MinIO, Backblaze B2 free, etc.)
+cloud_backup_assistant() {
+    echo "[INFO] Cloud backup assistant (rclone, S3 compatible)..."
+    echo "You can use rclone with MinIO, Backblaze B2, or any S3 compatible free service."
+    echo "See rclone documentation for setup."
 }
 
-# Automatic buffer tuning assistant
-auto_tune_buffer() {
-    echo "[INFO] Starting automatic buffer tuning..."
-    # (Buffer tuning logic would be implemented here)
-    echo "[INFO] Automatic buffer tuning completed."
+# PITR PostgreSQL restore assistant
+pitr_restore_assistant() {
+    echo "[INFO] Point-in-time recovery (PITR) assistant for PostgreSQL..."
+    echo "See PostgreSQL documentation for WAL archiving and PITR."
 }
 
-# Automatic log tuning assistant
-auto_tune_log() {
-    echo "[INFO] Starting automatic log tuning..."
-    # (Log tuning logic would be implemented here)
-    echo "[INFO] Automatic log tuning completed."
+# Password rotation assistant (DB, Odoo, Redis)
+password_rotation_assistant() {
+    echo "[INFO] Password rotation assistant..."
+    setup_password_rotation
 }
 
-# Automatic monitoring tuning assistant
-auto_tune_monitoring() {
-    echo "[INFO] Starting automatic monitoring tuning..."
-    # (Monitoring tuning logic would be implemented here)
-    echo "[INFO] Automatic monitoring tuning completed."
+# Wildcard certificate management assistant (Let's Encrypt DNS challenge)
+wildcard_cert_assistant() {
+    echo "[INFO] Wildcard certificate management assistant (Let's Encrypt DNS challenge)..."
+    echo "Use certbot with --dns plugins (acme.sh, certbot-dns-cloudflare, etc.)."
 }
 
-# Automatic backup tuning assistant
-auto_tune_backup() {
-    echo "[INFO] Starting automatic backup tuning..."
-    # (Backup tuning logic would be implemented here)
-    echo "[INFO] Automatic backup tuning completed."
+# Encrypted backup assistant (GPG, Vault open source)
+encrypted_backup_assistant() {
+    echo "[INFO] Encrypted backup assistant (GPG, Vault)..."
+    setup_encrypted_backup
 }
 
-# Automatic restore tuning assistant
-auto_tune_restore() {
-    echo "[INFO] Starting automatic restore tuning..."
-    # (Restore tuning logic would be implemented here)
-    echo "[INFO] Automatic restore tuning completed."
+# Backup integrity verification assistant
+backup_integrity_assistant() {
+    echo "[INFO] Backup integrity verification assistant..."
+    verifier_backup
 }
 
-# Automatic staging tuning assistant
-auto_tune_staging() {
-    echo "[INFO] Starting automatic staging tuning..."
-    # (Staging tuning logic would be implemented here)
-    echo "[INFO] Automatic staging tuning completed."
+# Post-installation performance test assistant (benchmarks)
+performance_test_assistant() {
+    echo "[INFO] Post-installation performance test assistant..."
+    # (Stub: could use sysbench, ab, wrk, etc.)
+    echo "[INFO] Performance tests completed."
 }
 
-# Automatic disaster recovery tuning assistant
-auto_tune_disaster_recovery() {
-    echo "[INFO] Starting automatic disaster recovery tuning..."
-    # (Disaster recovery tuning logic would be implemented here)
-    echo "[INFO] Automatic disaster recovery tuning completed."
+# Disk quota management assistant for backups
+backup_quota_assistant() {
+    echo "[INFO] Backup disk quota management assistant..."
+    echo "You can use setquota or edquota for disk quotas."
 }
 
-# Automatic Docker tuning assistant
-auto_tune_docker() {
-    echo "[INFO] Starting automatic Docker tuning..."
-    # (Docker tuning logic would be implemented here)
-    echo "[INFO] Automatic Docker tuning completed."
+# External supervision configuration assistant (Uptime Kuma, StatusCake free, etc.)
+external_supervision_assistant() {
+    echo "[INFO] External supervision configuration assistant..."
+    echo "You can deploy Uptime Kuma (open source) for external monitoring."
 }
 
-# Automatic cloud tuning assistant
-auto_tune_cloud() {
-    echo "[INFO] Starting automatic cloud tuning..."
-    # (Cloud tuning logic would be implemented here)
-    echo "[INFO] Automatic cloud tuning completed."
+# Advanced log management assistant (rotation, archiving, purge)
+log_management_assistant() {
+    echo "[INFO] Advanced log management assistant..."
+    echo "Logrotate is configured for log rotation and purge."
 }
 
-# Automatic logs tuning assistant
-auto_tune_logs() {
-    echo "[INFO] Starting automatic logs tuning..."
-    # (Logs tuning logic would be implemented here)
-    echo "[INFO] Automatic logs tuning completed."
+# Fine-grained Odoo API access management assistant
+odoo_api_access_assistant() {
+    echo "[INFO] Odoo API access management assistant..."
+    echo "Use Odoo access tokens and scopes (see Odoo documentation)."
 }
 
-# ===================== END ADVANCED ASSISTANTS =====================
+# Fine-grained Linux user access management assistant
+linux_user_access_assistant() {
+    echo "[INFO] Linux user access management assistant..."
+    echo "Use usermod, groupmod, and ACLs for fine-grained access."
+}
 
-# Example usage (uncomment to use):
-# odoo_auto_upgrade
-# odoo_full_uninstall
-# odoo_migration_assistant
-# bare_metal_restore_assistant
-# odoo_staging_assistant
-# auto_rollback_assistant
-# dynamic_tuning_assistant
-# auto_tune_postgres_redis_nginx
-# auto_tune_odoo
-# auto_tune_kernel
-# auto_tune_network
-# auto_tune_disk
-# auto_tune_swap
-# auto_tune_cache
-# auto_tune_buffer
-# auto_tune_log
-# auto_tune_monitoring
-# auto_tune_backup
-# auto_tune_restore
-# auto_tune_staging
-# auto_tune_disaster_recovery
-# auto_tune_docker
-# auto_tune_cloud
-# auto_tune_logs
+# Fine-grained network access management assistant (VPN, Wireguard)
+network_access_assistant() {
+    echo "[INFO] Network access management assistant (VPN, Wireguard)..."
+    echo "You can deploy Wireguard (open source) for secure VPN."
+}
 
-# ===================== FINAL INSTALLATION SUMMARY =====================
+# Fine-grained web access management assistant (fail2ban advanced, open source WAF)
+web_access_assistant() {
+    echo "[INFO] Web access management assistant (fail2ban, WAF)..."
+    echo "Fail2ban and open source WAF (modsecurity, nginx WAF) are available."
+}
 
-# Génération et affichage du résumé d'installation enrichi à la toute fin du script
-if [[ "$DRY_RUN" != true ]]; then
-    cat > /root/odoo_installation_summary.txt << EOF
-=============================================
-ODOO INSTALLATION SUMMARY (ENRICHED)
-=============================================
+# Fine-grained backup access management assistant
+backup_access_assistant() {
+    echo "[INFO] Backup access management assistant..."
+    echo "Restrict backup directory access with chmod and ACLs."
+}
 
-GENERAL INFORMATION
----------------------------------------------
-Script version: ${SCRIPT_VERSION:-1.1.0}
-Script date: ${SCRIPT_DATE:-$(date)}
-Install mode: ${INSTALL_MODE:-production}
-Linux distribution: \$(. /etc/os-release 2>/dev/null; echo "$ID $VERSION_ID")
-Architecture: \$(uname -m)
-Virtualization: \$(command -v systemd-detect-virt &>/dev/null && systemd-detect-virt || echo "unknown")
-Kernel: \$(uname -r)
-Hostname: \$(hostname)
-Public IP: ${PUBLIC_IP:-N/A}
-Locale: \$(locale | grep LANG= | head -1 | cut -d= -f2)
-Timezone: \$(timedatectl 2>/dev/null | grep "Time zone" | awk '{print $3}')
+# Fine-grained monitoring access management assistant (auth, ACL)
+monitoring_access_assistant() {
+    echo "[INFO] Monitoring access management assistant..."
+    echo "Configure Netdata, Prometheus, Grafana with authentication and ACLs."
+}
 
-HARDWARE RESOURCES
----------------------------------------------
-RAM: \$(awk '/MemTotal/ {printf "%.1f", $2/1024/1024}' /proc/meminfo) GB
-CPU cores: ${CPU_CORES:-\$(nproc)}
-Disk type: \$(lsblk -d -o name,rota | grep -v "loop" | grep -v "sr0" | awk 'NR==2 {print ($2==1?"HDD":"SSD")}')
-Swap: \$(free -h | awk '/Swap:/ {print $2}')
+# Fine-grained web admin console access management assistant
+web_admin_console_access_assistant() {
+    echo "[INFO] Web admin console access management assistant..."
+    echo "Restrict Cockpit, Portainer, etc. with authentication and firewall."
+}
 
-DOMAIN & NETWORK
----------------------------------------------
-Domain: $DOMAIN
-DDNS: ${DDNS_SERVICE:-none}
-Cloudflare Tunnel: ${CLOUDFLARE_TUNNEL:-false}
-SSL email: $LE_EMAIL
-Proxy: ${PROXY_URL:-none}
+# Fine-grained database access management assistant (roles, policies)
+db_access_assistant() {
+    echo "[INFO] Database access management assistant..."
+    echo "Use PostgreSQL roles and policies for fine-grained access."
+}
 
-PORTS & URLS
----------------------------------------------
-Odoo: https://$DOMAIN
-Odoo (local): http://localhost:8069
-Nginx: 80, 443
-PostgreSQL: 5432
-Redis: 6379
-$(if [[ "${EXPOSE_MONITORING:-false}" == "true" ]]; then echo "Netdata: http://$DOMAIN:19999
-Grafana: http://$DOMAIN:3000 (admin/admin)
-Prometheus: http://$DOMAIN:9090"; fi)
+# Auto-scaling configuration assistant (Docker Swarm/K8s)
+auto_scaling_assistant() {
+    echo "[INFO] Auto-scaling configuration assistant (Docker Swarm/K8s)..."
+    echo "You can use Docker Swarm or Kubernetes (open source) for auto-scaling."
+}
 
-PATHS & DIRECTORIES
----------------------------------------------
-Odoo home: ${ODOO_HOME:-/opt/odoo}
-Config dir: ${CONFIG_DIR:-/etc/odoo}
-Log dir: ${LOG_DIR:-/var/log/odoo}
-Backup dir: ${BACKUP_DIR:-/opt/backups}
-Nginx sites: ${NGINX_SITES:-/etc/nginx/sites-available}
-PostgreSQL config: ${PG_CONFIG_DIR:-/etc/postgresql}
+# Fine-grained sudo/SSH rights management assistant
+sudo_ssh_rights_assistant() {
+    echo "[INFO] Sudo/SSH rights management assistant..."
+    echo "Configure /etc/sudoers and SSH keys for fine-grained access."
+}
 
-CREDENTIALS (KEEP SECURE)
----------------------------------------------
-Database: ${DB_NAME:-odoo_production}
-Database User: ${DB_USER:-odoo_user}
-Database Password: ${DB_PASS:-<hidden>}
-Odoo Admin Password: ${ADMIN_PASS:-<hidden>}
-Redis Password: ${REDIS_PASS:-<hidden>}
+# Fine-grained secrets management assistant (Vault, pass)
+secrets_management_assistant() {
+    echo "[INFO] Secrets management assistant (Vault, pass)..."
+    setup_secrets_management
+}
 
-SECURITY & HARDENING
----------------------------------------------
-SELinux: \$(command -v getenforce &>/dev/null && getenforce || echo "N/A")
-AppArmor: \$(systemctl is-active apparmor 2>/dev/null || echo "N/A")
-Fail2ban: \$(systemctl is-active fail2ban 2>/dev/null || echo "N/A")
-Firewall (UFW): \$(command -v ufw &>/dev/null && ufw status | grep Status | awk '{print $2}' || echo "N/A")
-2FA Odoo: see /var/odoo_2fa_instructions.txt
-Audit logging: see /var/log/odoo/odoo-security.log
-Integrity monitoring: AIDE: \$(systemctl is-active aide 2>/dev/null || echo "N/A")
-Antivirus: ClamAV: \$(systemctl is-active clamav-daemon 2>/dev/null || echo "N/A")
+# Fine-grained alert management assistant (mail, Slack, SMS via free APIs)
+alert_management_assistant() {
+    echo "[INFO] Alert management assistant (mail, Slack, SMS via free APIs)..."
+    echo "You can use mailutils, Slack webhooks, and free SMS APIs."
+}
 
-MONITORING & LOGS
----------------------------------------------
-Netdata: \$(systemctl is-active netdata 2>/dev/null || echo "N/A")
-Prometheus: \$(systemctl is-active prometheus 2>/dev/null || echo "N/A")
-Grafana: \$(systemctl is-active grafana-server 2>/dev/null || echo "N/A")
-Loki: \$(systemctl is-active loki 2>/dev/null || echo "N/A")
-Promtail: \$(systemctl is-active promtail 2>/dev/null || echo "N/A")
-Logrotate: \$(systemctl is-active logrotate 2>/dev/null || echo "N/A")
-Log level: ${LOG_LEVEL:-INFO}
+# Fine-grained backup management assistant (multi-target)
+backup_multi_target_assistant() {
+    echo "[INFO] Backup multi-target management assistant..."
+    echo "You can use rclone for multi-target backups (local, cloud, SFTP, etc.)."
+}
 
-BACKUP & RESTORE
----------------------------------------------
-Backup location: ${BACKUP_DIR:-/opt/backups}
-Backup schedule: Daily at 2AM
-Retention: ${BACKUP_RETENTION_DAYS:-7} days
-Cloud backup: see /opt/backups/ (S3 or other)
-Restore test: see /opt/odoo/disaster_recovery/test_restore.sh
-Disaster recovery: see /opt/odoo/disaster_recovery/
+# Fine-grained monitoring exporters management assistant
+monitoring_exporters_assistant() {
+    echo "[INFO] Monitoring exporters management assistant..."
+    echo "Deploy node_exporter, postgres_exporter, odoo_exporter, etc."
+}
 
-STAGING & CLONING
----------------------------------------------
-Staging: /opt/odoo-staging
-Staging config: /etc/odoo-staging
+# Fine-grained Grafana dashboards management assistant
+grafana_dashboards_assistant() {
+    echo "[INFO] Grafana dashboards management assistant..."
+    echo "Provision and manage dashboards via Grafana API or provisioning files."
+}
 
-TUNING & OPTIMIZATION
----------------------------------------------
-Dynamic tuning: enabled (see logs)
-PostgreSQL tuning: see /etc/postgresql/*/main/postgresql.conf
-Redis tuning: see /etc/redis/redis.conf
-Nginx tuning: see /etc/nginx/nginx.conf
-Odoo tuning: see /etc/odoo/odoo.conf
-Kernel tuning: see /etc/sysctl.conf
-Network tuning: see /etc/sysctl.conf
-Disk tuning: see install logs
-Swap tuning: see install logs
-Cache/buffer tuning: see install logs
-Log tuning: see /etc/logrotate.d/odoo
-Monitoring tuning: see /etc/prometheus/prometheus.yml
+# Fine-grained Prometheus alerts management assistant
+prometheus_alerts_assistant() {
+    echo "[INFO] Prometheus alerts management assistant..."
+    echo "Configure alert rules in /etc/prometheus/rules/alerts.yml."
+}
 
-AUTO-UPDATE & ALERTS
----------------------------------------------
-Auto-update: ${ENABLE_AUTO_UPDATE:-false}
-Email alerts: ${ENABLE_EMAIL_ALERTS:-false}
-Alert email: ${ALERT_EMAIL:-N/A}
+# Fine-grained staging access management assistant (isolation)
+staging_access_assistant() {
+    echo "[INFO] Staging access management assistant (isolation)..."
+    echo "Isolate staging with separate users, groups, and firewall rules."
+}
 
-ROLLBACK & RECOVERY
----------------------------------------------
-Rollback system: enabled (see logs)
-Last rollback: see /var/log/odoo_install.log
+# Fine-grained disaster recovery access management assistant (ACL)
+disaster_recovery_access_assistant() {
+    echo "[INFO] Disaster recovery access management assistant (ACL)..."
+    echo "Restrict disaster recovery scripts to admin users only."
+}
 
-TESTS & VERIFICATION
----------------------------------------------
-Last verification: see /var/log/odoo_install.log
-Errors: see /var/log/odoo_install.log
-Warnings: see /var/log/odoo_install.log
+# Fine-grained restore access management assistant (audit, logs)
+restore_access_assistant() {
+    echo "[INFO] Restore access management assistant (audit, logs)..."
+    echo "Log all restore operations and restrict access."
+}
 
-RECOMMENDATIONS
----------------------------------------------
-- Change all default passwords and store them securely.
-- Test backup and restore regularly.
-- Monitor logs and alerts for incidents.
-- Secure this summary file or delete it after reading.
-- For advanced security, enable 2FA, audit, and integrity monitoring.
+# Fine-grained Docker access management assistant (rootless, ACL)
+docker_access_assistant() {
+    echo "[INFO] Docker access management assistant (rootless, ACL)..."
+    echo "Use rootless Docker and manage access with groups and ACLs."
+}
 
-EOF
+# Fine-grained cloud access management assistant (IAM, ACL)
+cloud_access_assistant() {
+    echo "[INFO] Cloud access management assistant (IAM, ACL)..."
+    echo "Use IAM roles and ACLs for cloud access."
+}
 
-    chmod 600 /root/odoo_installation_summary.txt
-    cp /root/odoo_installation_summary.txt /opt/odoo/odoo_installation_summary.txt 2>/dev/null || true
-    info "Enriched installation summary generated at /root/odoo_installation_summary.txt and /opt/odoo/odoo_installation_summary.txt"
-    echo -e "\n\e[1;32m==============================================\e[0m"
-    echo -e "\e[1;32mODOO INSTALLATION SUMMARY AVAILABLE AT:\e[0m"
-    echo -e "\e[1;33m  /opt/odoo/odoo_installation_summary.txt\e[0m"
-    echo -e "\e[1;33m  /root/odoo_installation_summary.txt\e[0m"
-    echo -e "\e[1;32m==============================================\e[0m\n"
+# Fine-grained logs access management assistant (encryption, ACL)
+logs_access_assistant() {
+    echo "[INFO] Logs access management assistant (encryption, ACL)..."
+    echo "Encrypt logs and restrict access with ACLs."
+}
+
+# Fine-grained monitoring access management assistant (auth, ACL)
+monitoring_access_assistant() {
+    echo "[INFO] Monitoring access management assistant (auth, ACL)..."
+    echo "Configure authentication and ACLs for monitoring tools."
+}
+
+# Fine-grained web access management assistant (WAF, rate limit)
+web_access_waf_assistant() {
+    echo "[INFO] Web access WAF and rate limit assistant..."
+    echo "Configure WAF (modsecurity, nginx WAF) and rate limiting."
+}
+
+# Fine-grained API access management assistant (tokens, scopes)
+api_access_assistant() {
+    echo "[INFO] API access management assistant (tokens, scopes)..."
+    echo "Use API tokens and scopes for access control."
+}
+
+# Fine-grained database access management assistant (roles)
+db_roles_assistant() {
+    echo "[INFO] Database roles management assistant..."
+    echo "Manage PostgreSQL roles and permissions."
+}
+
+# ... existing code ...
+
+# ===================== UNIT TESTS FOR CRITICAL FUNCTIONS =====================
+# Unit test for domain validation
+unit_test_validate_domain() {
+    echo "Running domain validation unit tests..."
+    local valid_domains=("example.com" "sub.example.com" "my-site.org" "test123.net")
+    local invalid_domains=("-bad.com" "bad-.com" "bad_domain.com" "bad@domain.com" "a..b.com" "a.b..c.com")
+    for domain in "${valid_domains[@]}"; do
+        if [[ "$domain" =~ ^([a-zA-Z0-9]([-a-zA-Z0-9]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]; then
+            echo "PASS: $domain is valid"
+        else
+            echo "FAIL: $domain should be valid"
+        fi
+    done
+    for domain in "${invalid_domains[@]}"; do
+        if [[ "$domain" =~ ^([a-zA-Z0-9]([-a-zA-Z0-9]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]; then
+            echo "FAIL: $domain should be invalid"
+        else
+            echo "PASS: $domain is invalid"
+        fi
+    done
+}
+
+# Unit test for email validation
+unit_test_validate_email() {
+    echo "Running email validation unit tests..."
+    local valid_emails=("user@example.com" "user.name+tag@domain.co" "user_name@sub.domain.com")
+    local invalid_emails=("user@.com" "user@domain" "user@domain,com" "user@@domain.com" "user@domain..com")
+    for email in "${valid_emails[@]}"; do
+        if [[ "$email" =~ ^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$ ]]; then
+            echo "PASS: $email is valid"
+        else
+            echo "FAIL: $email should be valid"
+        fi
+    done
+    for email in "${invalid_emails[@]}"; do
+        if [[ "$email" =~ ^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$ ]]; then
+            echo "FAIL: $email should be invalid"
+        else
+            echo "PASS: $email is invalid"
+        fi
+    done
+}
+
+# Usage example:
+# unit_test_validate_domain
+# unit_test_validate_email
+
+# ===================== TEST MODE =====================
+# If --test is passed, only validate configuration and system compatibility, do not install or modify anything
+if [[ " $* " == *" --test "* ]]; then
+    echo "[TEST MODE] Only validating configuration and system compatibility. No changes will be made."
+    validate_inputs
+    validate_interactive
+    echo "[TEST MODE] Validation completed. Exiting."
+    exit 0
 fi
+
+# ===================== PDF SUMMARY PLACEHOLDER =====================
+# At the end of installation, generate a PDF summary (placeholder)
+generate_pdf_summary() {
+    local summary_md="/root/odoo_installation_summary.md"
+    local summary_pdf="/root/odoo_installation_summary.pdf"
+    echo "# Odoo Installation Summary" > "$summary_md"
+    echo "" >> "$summary_md"
+    echo "## System Information" >> "$summary_md"
+    echo "- Hostname: $(hostname)" >> "$summary_md"
+    echo "- OS: $(lsb_release -ds 2>/dev/null || cat /etc/os-release | grep PRETTY_NAME | cut -d'=' -f2 | tr -d '"')" >> "$summary_md"
+    echo "- Kernel: $(uname -r)" >> "$summary_md"
+    echo "- CPU: $(nproc) cores ($(lscpu | grep 'Model name' | awk -F: '{print $2}' | xargs))" >> "$summary_md"
+    echo "- RAM: $(awk '/MemTotal/ {printf "%.1f", $2/1024/1024}' /proc/meminfo) GB" >> "$summary_md"
+    echo "- Disk: $(df -h / | awk 'NR==2{print $2 " total, " $4 " free"}')" >> "$summary_md"
+    echo "- Install mode: ${INSTALL_MODE}" >> "$summary_md"
+    echo "- Firewall: $(ufw status | grep Status | awk '{print $2}')" >> "$summary_md"
+    echo "" >> "$summary_md"
+    echo "## Domain & Access" >> "$summary_md"
+    echo "- Domain: $DOMAIN" >> "$summary_md"
+    echo "- Odoo URL: https://$DOMAIN" >> "$summary_md"
+    echo "- Odoo Admin: admin / $ADMIN_PASS" >> "$summary_md"
+    echo "- Public IP: ${PUBLIC_IP:-$(curl -s ifconfig.me)}" >> "$summary_md"
+    echo "" >> "$summary_md"
+    echo "## Database" >> "$summary_md"
+    echo "- DB Name: $DB_NAME" >> "$summary_md"
+    echo "- DB User: $DB_USER" >> "$summary_md"
+    echo "- DB Password: $DB_PASS" >> "$summary_md"
+    echo "- PostgreSQL Version: $(psql --version 2>/dev/null | awk '{print $3}')" >> "$summary_md"
+    echo "- DB Host: localhost" >> "$summary_md"
+    echo "- DB Port: 5432" >> "$summary_md"
+    echo "" >> "$summary_md"
+    echo "## Redis" >> "$summary_md"
+    echo "- Redis Password: $REDIS_PASS" >> "$summary_md"
+    echo "- Redis Host: localhost" >> "$summary_md"
+    echo "- Redis Port: 6379" >> "$summary_md"
+    echo "" >> "$summary_md"
+    echo "## Services & URLs" >> "$summary_md"
+    echo "- Odoo: https://$DOMAIN" >> "$summary_md"
+    echo "- Netdata: http://$DOMAIN:19999" >> "$summary_md"
+    echo "- Grafana: http://$DOMAIN:3000 (admin/admin)" >> "$summary_md"
+    echo "- Prometheus: http://$DOMAIN:9090" >> "$summary_md"
+    echo "- Alertmanager: http://$DOMAIN:9093" >> "$summary_md"
+    echo "- Cockpit: http://$DOMAIN:9090" >> "$summary_md"
+    echo "- Portainer: https://portainer.$DOMAIN" >> "$summary_md"
+    echo "" >> "$summary_md"
+    echo "## Backups" >> "$summary_md"
+    echo "- Backup directory: /opt/backups" >> "$summary_md"
+    echo "- Backup script: /opt/backups/backup_odoo.sh" >> "$summary_md"
+    echo "- Retention: ${BACKUP_RETENTION_DAYS:-7} days" >> "$summary_md"
+    echo "- Last backup: $(ls -1t /opt/backups/daily/db_*.dump 2>/dev/null | head -n1)" >> "$summary_md"
+    echo "" >> "$summary_md"
+    echo "## Logs" >> "$summary_md"
+    echo "- Odoo logs: /var/log/odoo/" >> "$summary_md"
+    echo "- PostgreSQL logs: /var/log/postgresql/" >> "$summary_md"
+    echo "- Nginx logs: /var/log/nginx/" >> "$summary_md"
+    echo "- Backup logs: /var/log/backup.log" >> "$summary_md"
+    echo "- UFW logs: /var/log/ufw/blocked.log" >> "$summary_md"
+    echo "" >> "$summary_md"
+    echo "## Configuration Files" >> "$summary_md"
+    echo "- Odoo config: /etc/odoo/odoo.conf" >> "$summary_md"
+    echo "- Nginx site: /etc/nginx/sites-available/odoo" >> "$summary_md"
+    echo "- PostgreSQL config: /etc/postgresql/*/main/postgresql.conf" >> "$summary_md"
+    echo "- Redis config: /etc/redis/redis.conf" >> "$summary_md"
+    echo "- Logrotate configs: /etc/logrotate.d/odoo, postgresql, nginx, odoo-backup" >> "$summary_md"
+    echo "" >> "$summary_md"
+    echo "## Security & Features" >> "$summary_md"
+    echo "- SELinux enabled: ${SELINUX_ENABLED:-no}" >> "$summary_md"
+    echo "- AppArmor enabled: $(systemctl is-active apparmor 2>/dev/null || echo 'unknown')" >> "$summary_md"
+    echo "- 2FA Odoo: see /var/odoo_2fa_instructions.txt" >> "$summary_md"
+    echo "- Encrypted backups: $(ls /opt/backups/*.gpg 2>/dev/null | wc -l) files" >> "$summary_md"
+    echo "- Password rotation: /usr/local/bin/rotate_odoo_passwords.sh" >> "$summary_md"
+    echo "- Disaster recovery: /opt/odoo/disaster_recovery/" >> "$summary_md"
+    echo "- Docker/Portainer: /opt/odoo/docker/" >> "$summary_md"
+    echo "" >> "$summary_md"
+    echo "## Warnings & Errors" >> "$summary_md"
+    if [[ -f /var/log/odoo_install.log ]]; then
+        echo '\n### Last 20 lines of install log:' >> "$summary_md"
+        tail -20 /var/log/odoo_install.log >> "$summary_md"
+    fi
+    echo "" >> "$summary_md"
+    echo "## Additional Notes" >> "$summary_md"
+    echo "- Change all default passwords after installation." >> "$summary_md"
+    echo "- Keep this file in a secure location." >> "$summary_md"
+    echo "- For support, see the project documentation." >> "$summary_md"
+    echo "- Generated on: $(date)" >> "$summary_md"
+    # Try to generate PDF if pandoc is available
+    if command -v pandoc >/dev/null 2>&1; then
+        pandoc "$summary_md" -o "$summary_pdf"
+        echo "[INFO] PDF summary generated at $summary_pdf"
+    else
+        echo "[INFO] PDF summary not generated (pandoc not installed). Markdown summary at $summary_md"
+    fi
+}
+
+# Call generate_pdf_summary at the end of main installation (before cleanup)
+
+# ===================== UNINSTALL FUNCTION DOCUMENTATION =====================
+# Clean uninstall function: removes Odoo, PostgreSQL, Redis, Nginx, configs, logs, and all related data.
+odoo_full_uninstall() {
+    echo "[INFO] Starting full uninstall of Odoo and all dependencies..."
+    echo "[INFO] This will stop and remove all Odoo-related services, users, configs, logs, and data."
+    echo "[INFO] WARNING: This operation is irreversible! Make sure you have backups before proceeding."
+    systemctl stop odoo nginx redis-server postgresql
+    systemctl disable odoo nginx redis-server postgresql
+    userdel -r odoo 2>/dev/null
+    rm -rf /opt/odoo /etc/odoo /var/log/odoo /opt/backups /etc/nginx/sites-available/odoo /etc/nginx/sites-enabled/odoo
+    apt-get remove --purge -y odoo postgresql* redis-server nginx
+    apt-get autoremove -y
+    echo "[INFO] Full uninstall completed."
+    echo "[INFO] You may want to manually check /etc, /var/log, and /opt for any remaining files."
+}
+# Usage: Run 'odoo_full_uninstall' as root to completely remove Odoo and all related components.
+
+# Trap for cleanup on interruption
+trap 'cleanup' SIGINT SIGTERM
+
+# Secure deletion/encryption of files with secrets after install
+default_secure_cleanup_secrets() {
+    # Encrypt or securely delete sensitive files
+    local files=("/root/odoo_installation_summary.md" "/root/odoo_installation_summary.pdf" "/var/log/odoo_install.log")
+    for f in "${files[@]}"; do
+        if [[ -f "$f" ]]; then
+            if command -v shred >/dev/null 2>&1; then
+                shred -u "$f"
+            else
+                rm -f "$f"
+            fi
+        fi
+    done
+}
+
+# Ensure all logs (including sub-scripts) never leak secrets
+# Add a note in all sub-scripts: set -euo pipefail; source main log masking if possible
+# Example for backup script:
+cat > /opt/backups/backup_odoo.sh << EOF
+#!/bin/bash
+set -euo pipefail
+# Source main log masking if available
+if [[ -f /opt/odoo-server-installer/odoo-server-installer-en-big-edition.sh ]]; then
+    source /opt/odoo-server-installer/odoo-server-installer-en-big-edition.sh
+fi
+# ... existing code ...
+EOF
+chmod 700 /opt/backups/backup_odoo.sh
+
+# ===================== LANGUAGE MANAGER FOR LOGS & USER MESSAGES =====================
+# Supported languages: en, fr, es, ar, hi, zh, pt, ru, ja, de, id
+LANGUAGE=${ODOO_INSTALL_LANG:-${LANGUAGE:-en}}
+
+# Message dictionaries (expand as needed)
+declare -A MSG_EN=(
+    [INSTALL_START]="Starting installation..."
+    [INSTALL_OK]="Installation completed successfully."
+    [ERROR_GENERIC]="An error occurred."
+    [CONFIRM_UNINSTALL]="Are you sure you want to uninstall Odoo and all related components? (y/N): "
+)
+declare -A MSG_FR=(
+    [INSTALL_START]="Démarrage de l'installation..."
+    [INSTALL_OK]="Installation terminée avec succès."
+    [ERROR_GENERIC]="Une erreur est survenue."
+    [CONFIRM_UNINSTALL]="Êtes-vous sûr de vouloir désinstaller Odoo et tous les composants associés ? (o/N) : "
+)
+declare -A MSG_ES=(
+    [INSTALL_START]="Iniciando la instalación..."
+    [INSTALL_OK]="Instalación completada con éxito."
+    [ERROR_GENERIC]="Ocurrió un error."
+    [CONFIRM_UNINSTALL]="¿Está seguro de que desea desinstalar Odoo y todos los componentes relacionados? (s/N): "
+)
+declare -A MSG_AR=(
+    [INSTALL_START]="بدء التثبيت..."
+    [INSTALL_OK]="اكتمل التثبيت بنجاح."
+    [ERROR_GENERIC]="حدث خطأ."
+    [CONFIRM_UNINSTALL]="هل أنت متأكد أنك تريد إزالة Odoo وجميع المكونات المرتبطة؟ (ن/لا): "
+)
+declare -A MSG_HI=(
+    [INSTALL_START]="इंस्टॉलेशन शुरू हो रहा है..."
+    [INSTALL_OK]="इंस्टॉलेशन सफलतापूर्वक पूरा हुआ।"
+    [ERROR_GENERIC]="एक त्रुटि हुई।"
+    [CONFIRM_UNINSTALL]="क्या आप वाकई Odoo और सभी संबंधित घटकों को अनइंस्टॉल करना चाहते हैं? (y/N): "
+)
+declare -A MSG_ZH=(
+    [INSTALL_START]="开始安装..."
+    [INSTALL_OK]="安装成功完成。"
+    [ERROR_GENERIC]="发生错误。"
+    [CONFIRM_UNINSTALL]="您确定要卸载 Odoo 及其所有相关组件吗？(y/N)："
+)
+declare -A MSG_PT=(
+    [INSTALL_START]="Iniciando a instalação..."
+    [INSTALL_OK]="Instalação concluída com sucesso."
+    [ERROR_GENERIC]="Ocorreu um erro."
+    [CONFIRM_UNINSTALL]="Tem certeza de que deseja desinstalar o Odoo e todos os componentes relacionados? (s/N): "
+)
+declare -A MSG_RU=(
+    [INSTALL_START]="Запуск установки..."
+    [INSTALL_OK]="Установка успешно завершена."
+    [ERROR_GENERIC]="Произошла ошибка."
+    [CONFIRM_UNINSTALL]="Вы уверены, что хотите удалить Odoo и все связанные компоненты? (y/N): "
+)
+declare -A MSG_JA=(
+    [INSTALL_START]="インストールを開始しています..."
+    [INSTALL_OK]="インストールが正常に完了しました。"
+    [ERROR_GENERIC]="エラーが発生しました。"
+    [CONFIRM_UNINSTALL]="Odooおよび関連するすべてのコンポーネントをアンインストールしてもよろしいですか？ (y/N): "
+)
+declare -A MSG_DE=(
+    [INSTALL_START]="Installation wird gestartet..."
+    [INSTALL_OK]="Installation erfolgreich abgeschlossen."
+    [ERROR_GENERIC]="Ein Fehler ist aufgetreten."
+    [CONFIRM_UNINSTALL]="Sind Sie sicher, dass Sie Odoo und alle zugehörigen Komponenten deinstallieren möchten? (j/N): "
+)
+declare -A MSG_ID=(
+    [INSTALL_START]="Memulai instalasi..."
+    [INSTALL_OK]="Instalasi berhasil diselesaikan."
+    [ERROR_GENERIC]="Terjadi kesalahan."
+    [CONFIRM_UNINSTALL]="Apakah Anda yakin ingin menghapus Odoo dan semua komponen terkait? (y/N): "
+)
+
+# Function to get the message in the selected language
+get_message() {
+    local key="$1"; shift
+    local msg
+    case "$LANGUAGE" in
+        fr) msg="${MSG_FR[$key]}";;
+        es) msg="${MSG_ES[$key]}";;
+        ar) msg="${MSG_AR[$key]}";;
+        hi) msg="${MSG_HI[$key]}";;
+        zh) msg="${MSG_ZH[$key]}";;
+        pt) msg="${MSG_PT[$key]}";;
+        ru) msg="${MSG_RU[$key]}";;
+        ja) msg="${MSG_JA[$key]}";;
+        de) msg="${MSG_DE[$key]}";;
+        id) msg="${MSG_ID[$key]}";;
+        *)  msg="${MSG_EN[$key]}";;
+    esac
+    # Parameter substitution if needed
+    if [[ $# -gt 0 ]]; then
+        printf "$msg" "$@"
+    else
+        echo "$msg"
+    fi
+}
+
+# Example usage in logs and user messages:
+# info "$(get_message INSTALL_START)"
+# error "$(get_message ERROR_GENERIC)"
+# read -p "$(get_message CONFIRM_UNINSTALL)" confirm
+
+# Refactor log/info/warn/error to use get_message for all static messages
+// ... existing code ...

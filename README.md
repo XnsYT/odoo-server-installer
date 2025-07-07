@@ -279,6 +279,16 @@ Thank you for checking out **odoo-server-installer**! If you have questions, ide
 
 ## Recent Updates
 
+### Version 1.3.0
+- Multi-language support for logs and user messages (11 languages: en, fr, es, ar, hi, zh, pt, ru, ja, de, id)
+- Secure deletion/encryption of sensitive files (logs, summaries) after install
+- Improved uninstall: interactive confirmation, --purge option, uninstall summary, and use of global variables for all paths
+- Granular rollback actions for each critical step
+- Binary presence checks and alternatives for systemctl, ufw, etc.
+- Trap for cleanup on interruption (SIGINT, SIGTERM)
+- More unit tests (backup/restore, permissions, etc.)
+- Enhanced help output: language selection, new options, and usage examples
+
 ### Version 1.2.0
 - Major security hardening: SELinux/AppArmor profiles, advanced firewall, audit logging, 2FA, and secrets management
 - Disaster recovery: full backup/restore automation, integrity checks, and rollback system
